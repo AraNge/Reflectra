@@ -1,0 +1,297 @@
+from typing import Literal, Optional
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from src.models.clip_encoder import PretrainedCLIPEncoder
+from src.models.clap_encoder import PretrainedCLAPEncoder
+from src.models.projection_head import MLPProjection, LinearProjection, QFormerHead
+
+
+ProjectionType = Literal["mlp", "linear"]
+
+
+class ReflectraModel(nn.Module):
+    """
+    Full Reflectra model.
+
+    Components:
+    - CLIP image encoder
+    - projection head: CLIP space -> CLAP space
+    - CLAP text encoder
+    - CLAP audio encoder
+
+    Main goal:
+        image -> CLIP image embedding -> projection -> CLAP-compatible embedding
+
+    Then the projected image embedding can be searched against
+    Qdrant audio embeddings produced by CLAP audio encoder.
+    """
+
+    def __init__(
+        self,
+        clip_model_name: str = "openai/clip-vit-base-patch32",
+        clap_model_name: str = "laion/clap-htsat-unfused",
+        projection_type: ProjectionType = "mlp",
+        projection_hidden_dim: int = 1024,
+        projection_dropout: float = 0.1,
+        freeze_clip: bool = True,
+        freeze_clap: bool = True,
+        normalize: bool = True,
+        device: Optional[str] = None,
+    ):
+        super().__init__()
+
+        self.normalize = normalize
+
+        self.clip_dim = self._get_clip_embedding_dim()
+        self.clap_dim = self._get_clap_embedding_dim()
+
+
+        self.clip = PretrainedCLIPEncoder(
+            model_name=clip_model_name,
+            freeze=freeze_clip,
+            device=device,
+        )
+
+        self.clap = PretrainedCLAPEncoder(
+            model_name=clap_model_name,
+            freeze=freeze_clap,
+            device=device,
+        )
+
+        if projection_type == "mlp":
+            self.image_projection = MLPProjection(
+                input_dim=self.clip_dim,
+                output_dim=self.clap_dim,
+                hidden_dim=projection_hidden_dim,
+                dropout=projection_dropout,
+                normalize=normalize,
+            )
+        elif projection_type == "linear":
+            self.image_projection = LinearProjection(
+                input_dim=self.clip_dim,
+                output_dim=self.clap_dim,
+                normalize=normalize,
+            )
+
+        self.to(self.device)
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+    
+
+    def _get_clip_embedding_dim(self) -> int:
+        """
+        Get CLIP image/text embedding dimension from the loaded CLIP model.
+        """
+
+        config = self.clip.model.config
+
+        if hasattr(config, "projection_dim"):
+            return int(config.projection_dim)
+
+        if hasattr(config, "hidden_size"):
+            return int(config.hidden_size)
+
+        raise ValueError(
+            "Could not infer CLIP embedding dimension from model config."
+        )
+
+    def _get_clap_embedding_dim(self) -> int:
+        """
+        Get CLAP audio/text embedding dimension from the loaded CLAP model.
+        """
+
+        config = self.clap.model.config
+
+        if hasattr(config, "projection_dim"):
+            return int(config.projection_dim)
+
+        if hasattr(config, "hidden_size"):
+            return int(config.hidden_size)
+
+        raise ValueError(
+            "Could not infer CLAP embedding dimension from model config."
+        )
+
+    def encode_image_clip(
+        self,
+        image_paths: list[str],
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Encode images with CLIP only.
+        Output shape: [batch, clip_dim]
+        """
+
+        return self.clip.encode_image(
+            image_paths=image_paths,
+            normalize=normalize,
+        )
+
+    def encode_image(
+        self,
+        image_paths: list[str],
+    ) -> torch.Tensor:
+        """
+        Encode image into CLAP-compatible embedding space.
+
+        image_paths
+            ↓
+        CLIP image encoder
+            ↓
+        projection head
+            ↓
+        projected image embedding in CLAP space
+        """
+
+        clip_image_embeds = self.encode_image_clip(
+            image_paths=image_paths,
+            normalize=True,
+        )
+
+        projected_image_embeds = self.image_projection(clip_image_embeds)
+
+        if self.normalize:
+            projected_image_embeds = F.normalize(projected_image_embeds, dim=-1)
+
+        return projected_image_embeds
+
+    def encode_text(
+        self,
+        texts: list[str],
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Encode text into CLAP embedding space.
+        """
+
+        return self.clap.encode_text(
+            texts=texts,
+            normalize=normalize,
+        )
+
+    def encode_audio(
+        self,
+        audio_paths: list[str],
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Encode audio into CLAP embedding space.
+        """
+
+        return self.clap.encode_audio(
+            audio_paths=audio_paths,
+            normalize=normalize,
+        )
+
+    def image_text_similarity(
+        self,
+        image_paths: list[str],
+        texts: list[str],
+    ) -> torch.Tensor:
+        """
+        Similarity between projected image embeddings and CLAP text embeddings.
+        """
+
+        image_embeds = self.encode_image(image_paths)
+        text_embeds = self.encode_text(texts, normalize=True)
+
+        return image_embeds @ text_embeds.T
+
+    def image_audio_similarity(
+        self,
+        image_paths: list[str],
+        audio_paths: list[str],
+    ) -> torch.Tensor:
+        """
+        Similarity between projected image embeddings and CLAP audio embeddings.
+        """
+
+        image_embeds = self.encode_image(image_paths)
+        audio_embeds = self.encode_audio(audio_paths, normalize=True)
+
+        return image_embeds @ audio_embeds.T
+
+    def text_audio_similarity(
+        self,
+        texts: list[str],
+        audio_paths: list[str],
+    ) -> torch.Tensor:
+        """
+        Native CLAP text-audio similarity.
+        """
+
+        text_embeds = self.encode_text(texts, normalize=True)
+        audio_embeds = self.encode_audio(audio_paths, normalize=True)
+
+        return text_embeds @ audio_embeds.T
+
+    def forward(
+        self,
+        image_paths: Optional[list[str]] = None,
+        texts: Optional[list[str]] = None,
+        audio_paths: Optional[list[str]] = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Flexible forward.
+
+        Example outputs:
+        - image_embeds
+        - text_embeds
+        - audio_embeds
+        - image_text_logits
+        - image_audio_logits
+        - text_audio_logits
+        """
+
+        output = {}
+
+        if image_paths is not None:
+            output["image_embeds"] = self.encode_image(image_paths)
+
+        if texts is not None:
+            output["text_embeds"] = self.encode_text(texts)
+
+        if audio_paths is not None:
+            output["audio_embeds"] = self.encode_audio(audio_paths)
+
+        if "image_embeds" in output and "text_embeds" in output:
+            output["image_text_logits"] = (
+                output["image_embeds"] @ output["text_embeds"].T
+            )
+
+        if "image_embeds" in output and "audio_embeds" in output:
+            output["image_audio_logits"] = (
+                output["image_embeds"] @ output["audio_embeds"].T
+            )
+
+        if "text_embeds" in output and "audio_embeds" in output:
+            output["text_audio_logits"] = (
+                output["text_embeds"] @ output["audio_embeds"].T
+            )
+
+        return output
+
+    def freeze_encoders(self) -> None:
+        """
+        Freeze CLIP and CLAP encoders.
+        Projection remains trainable.
+        """
+
+        self.clip.freeze()
+        self.clap.freeze()
+
+    def unfreeze_projection(self) -> None:
+        for param in self.image_projection.parameters():
+            param.requires_grad = True
+
+    def trainable_parameters(self):
+        return [
+            name
+            for name, param in self.named_parameters()
+            if param.requires_grad
+        ]

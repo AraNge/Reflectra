@@ -133,20 +133,3 @@ class PretrainedCLAPEncoder(torch.nn.Module):
             "audio_embeds": audio_embeds,
             "logits": logits,
         }
-
-
-if __name__ == "__main__":
-    encoder = PretrainedCLAPEncoder(freeze=True)
-
-    query = "happy energetic pop song with female vocals and dance rhythm"
-
-    audio_dir = Path("data/musiccaps_audio")
-    audio_files = sorted(str(path) for path in audio_dir.glob("*.wav"))
-
-    print(f"Found {len(audio_files)} wav files")
-    print(audio_files[:5])
-
-    scores = encoder.similarity(query, audio_files)
-
-    print("Similarity scores:")
-    print(scores.cpu().numpy())

@@ -52,6 +52,67 @@ class PretrainedCLIPEncoder(torch.nn.Module):
             raise FileNotFoundError(f"Image file not found: {image_path}")
 
         return Image.open(image_path).convert("RGB")
+    
+    @torch.no_grad()
+    def encode_image_tokens(
+        self,
+        image_paths: Union[str, List[str]],
+        include_cls_token: bool = True,
+        normalize: bool = False,
+    ) -> torch.Tensor:
+        """
+        Convert images into CLIP vision token embeddings.
+
+        This is useful for Q-Former, because Q-Former should attend to
+        a sequence of visual tokens, not only one global image embedding.
+
+        Args:
+            image_paths:
+                One image path or list of image paths.
+
+            include_cls_token:
+                If True, returns CLS token + patch tokens.
+                If False, removes the first CLS token and returns only patch tokens.
+
+            normalize:
+                If True, L2-normalize every token embedding.
+
+        Returns:
+            Tensor shape:
+                [batch_size, num_tokens, vision_hidden_dim]
+
+            Example for openai/clip-vit-base-patch32:
+                include_cls_token=True  -> [B, 50, 768]
+                include_cls_token=False -> [B, 49, 768]
+        """
+
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
+
+        images = [self.load_image(path) for path in image_paths]
+
+        inputs = self.processor(
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        pixel_values = inputs["pixel_values"].to(self.device_name)
+
+        outputs = self.model.vision_model(
+            pixel_values=pixel_values,
+            return_dict=True,
+        )
+
+        image_tokens = outputs.last_hidden_state
+
+        if not include_cls_token:
+            image_tokens = image_tokens[:, 1:, :]
+
+        if normalize:
+            image_tokens = F.normalize(image_tokens, p=2, dim=-1)
+
+        return image_tokens
 
     @torch.no_grad()
     def encode_image(
@@ -146,20 +207,3 @@ class PretrainedCLIPEncoder(torch.nn.Module):
         """
 
         return self.encode_image(image_paths, normalize=True)
-
-
-if __name__ == "__main__":
-    encoder = PretrainedCLIPEncoder(freeze=True)
-
-    image_path = "data/example_images/example.jpg"
-
-    texts = [
-        "a beach party with happy people",
-        "a sad rainy city street",
-        "a dog running in a park",
-        "a dark nightclub with neon lights",
-    ]
-
-    scores = encoder.image_text_similarity(image_path, texts)
-
-    print(scores.cpu().numpy())
