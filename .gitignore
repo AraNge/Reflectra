@@ -1,0 +1,15 @@
+# virtual env files
+venv
+env
+.venv
+
+# dataset files
+data
+
+.env
+
+__pycache__
+.vscode
+
+# evaluation
+evaluation_results

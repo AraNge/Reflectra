@@ -1,0 +1,29 @@
+[project]
+name = "reflectra"
+version = "0.1.0"
+description = "Image-to-music retrieval system using CLIP, CLAP, and Qdrant"
+authors = [
+    {name = "Aleksei Blinov"},
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+    "qdrant_client",
+    "numpy",
+    "librosa",
+    "pillow",
+    "tqdm",
+    "datasets",
+    "yt-dlp"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+reflectra-evaluate-clap = "src.evaluation.evaluate_clap:main"
+reflectra-evaluate-clip = "src.evaluation.evaluate_clip:main"
+reflectra-index-audio-qdrant = "src.vector_db.index_clap_audio_qdrant:main"
