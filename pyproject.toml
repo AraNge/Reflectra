@@ -10,13 +10,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
     "transformers",
-    "qdrant_client",
+    "qdrant-client",
     "numpy",
     "librosa",
     "pillow",
     "tqdm",
     "datasets",
-    "yt-dlp"
+    "yt-dlp",
+    "torchcodec"
 ]
 
 [build-system]

@@ -9,6 +9,15 @@ from src.datasets.preprocessing.sampling import (
     sample_by_dataset_counts,
     limit_total,
 )
+from src.datasets.paths import METADATA_DIR, PROJECT_ROOT
+
+
+DEFAULT_IMAGE_METADATA_PATHS = [
+    METADATA_DIR / "coco_captions_metadata.jsonl",
+    METADATA_DIR / "flickr30k_metadata.jsonl",
+    METADATA_DIR / "emoset_train_metadata.jsonl",
+    METADATA_DIR / "emoset_test_metadata.jsonl",
+]
 
 
 class ImageTextProjectionDataset(Dataset):
@@ -56,7 +65,7 @@ def collate_projection_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def parse_dataset_fractions(value: Optional[str]) -> Dict[str, float]:
     """
     Example:
-        "whyen-wang/coco_captions=0.5,nlphuji/flickr30k=0.8"
+        "coco_karpathy=0.5,nlphuji/flickr30k=0.8"
     """
 
     if not value:
@@ -74,7 +83,7 @@ def parse_dataset_fractions(value: Optional[str]) -> Dict[str, float]:
 def parse_dataset_counts(value: Optional[str]) -> Dict[str, int]:
     """
     Example:
-        "whyen-wang/coco_captions=50000,nlphuji/flickr30k=10000"
+        "coco_karpathy=50000,nlphuji/flickr30k=10000"
     """
 
     if not value:
@@ -90,8 +99,8 @@ def parse_dataset_counts(value: Optional[str]) -> Dict[str, int]:
 
 
 def load_projection_records(
-    metadata_paths: List[str | Path],
-    project_root: str | Path,
+    metadata_paths: Optional[List[str | Path]] = None,
+    project_root: str | Path = PROJECT_ROOT,
     train_split: str = "train",
     val_split: Optional[str] = None,
     dataset_fractions: Optional[str] = None,
@@ -103,6 +112,8 @@ def load_projection_records(
     """
     Loads image-text records and splits them into train/val records.
     """
+    if metadata_paths is None:
+        metadata_paths = DEFAULT_IMAGE_METADATA_PATHS
 
     loader = ImageTextMetadataLoader(
         metadata_paths=metadata_paths,

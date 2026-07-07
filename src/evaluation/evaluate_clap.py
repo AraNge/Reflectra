@@ -2,30 +2,37 @@ import argparse
 import json
 from pathlib import Path
 from typing import Dict
-
-import torch
-from tqdm import tqdm
+from src.utils.batch_encoding import encode_in_batches_clap
 
 from src.datasets.loaders.audio_metadata import AudioMetadataLoader
+from src.datasets.evaluation_inputs import build_sparse_grouped_retrieval_inputs
 from src.datasets.preprocessing.sampling import (
     sample_by_dataset_fractions,
     sample_by_dataset_counts,
     limit_total,
 )
-from src.metrics.retrieval_metrics import retrieval_metrics
+from src.metrics.retrieval_metrics import (
+    balanced_edge_retrieval_metrics,
+    sparse_binary_retrieval_metrics,
+    sparse_compute_metrics,
+    transpose_sparse_relevance,
+    validate_binary_metrics,
+)
 from src.models.clap_encoder import PretrainedCLAPEncoder
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
+METADATA_DIR = DATA_DIR / "metadata"
 
 
 DEFAULT_AUDIO_METADATA_PATHS = [
-    DATA_DIR / "musiccaps_metadata.jsonl",
-    DATA_DIR / "audioset_metadata.jsonl",
-    DATA_DIR / "song_describer_metadata.jsonl",
-    DATA_DIR / "mtg_jamendo_metadata" / "mtg_jamendo_train_metadata.jsonl",
-    DATA_DIR / "mtg_jamendo_metadata" / "mtg_jamendo_validation_metadata.jsonl",
+    METADATA_DIR / "musiccaps_metadata.jsonl",
+    METADATA_DIR / "audioset_metadata.jsonl",
+    METADATA_DIR / "audioset_balanced_metadata.jsonl",
+    METADATA_DIR / "audioset_unbalanced_metadata.jsonl",
+    METADATA_DIR / "song_describer_metadata.jsonl",
+    METADATA_DIR / "mtg_jamendo_train_metadata.jsonl",
+    METADATA_DIR / "mtg_jamendo_validation_metadata.jsonl",
 ]
 
 
@@ -55,33 +62,6 @@ def parse_dataset_counts(value: str | None) -> Dict[str, int]:
     return result
 
 
-def encode_in_batches(
-    model: PretrainedCLAPEncoder,
-    audio_paths: list[str],
-    texts: list[str],
-    batch_size: int,
-):
-    audio_embeddings = []
-    text_embeddings = []
-
-    for start in tqdm(range(0, len(audio_paths), batch_size), desc="Encoding CLAP"):
-        end = start + batch_size
-
-        batch_audio_paths = audio_paths[start:end]
-        batch_texts = texts[start:end]
-
-        audio_emb = model.encode_audio(batch_audio_paths)
-        text_emb = model.encode_text(batch_texts)
-
-        audio_embeddings.append(audio_emb.cpu())
-        text_embeddings.append(text_emb.cpu())
-
-    audio_embeddings = torch.cat(audio_embeddings, dim=0)
-    text_embeddings = torch.cat(text_embeddings, dim=0)
-
-    return audio_embeddings, text_embeddings
-
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -89,6 +69,13 @@ def main():
     parser.add_argument("--max-samples", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--model-name", type=str, default="laion/clap-htsat-unfused")
+    parser.add_argument(
+        "--metadata",
+        type=str,
+        nargs="*",
+        default=[str(path) for path in DEFAULT_AUDIO_METADATA_PATHS],
+        help="JSONL metadata files. Defaults to local audio-text metadata files.",
+    )
 
     parser.add_argument(
         "--dataset-fractions",
@@ -107,7 +94,7 @@ def main():
     args = parser.parse_args()
 
     loader = AudioMetadataLoader(
-        metadata_paths=DEFAULT_AUDIO_METADATA_PATHS,
+        metadata_paths=[Path(path) for path in args.metadata],
         project_root=PROJECT_ROOT,
         require_audio_exists=True,
     )
@@ -137,34 +124,101 @@ def main():
 
     records = limit_total(records, args.max_samples)
 
-    print(f"Evaluation samples: {len(records)}")
+    print(f"Loaded text records: {len(records)}")
 
-    audio_paths = [record["audio_path"] for record in records]
-    texts = [record["text"] for record in records]
+    if len(records) == 0:
+        raise RuntimeError("No valid audio-text records after filtering.")
+
+    audio_paths, texts, audio_to_text_relevance, input_stats = build_sparse_grouped_retrieval_inputs(
+        records=records,
+        media_id_field="audio_id",
+        media_path_field="audio_path",
+    )
+
+    num_positive_edges = input_stats["num_positive_edges"]
+
+    print(f"Unique audio files: {len(audio_paths)}")
+    print(f"Caption/query targets: {len(texts)}")
+    print(f"Sparse positive links: {num_positive_edges}")
+
+    if not audio_paths or not texts or num_positive_edges == 0:
+        raise RuntimeError("No valid grouped audio-text retrieval inputs found.")
 
     model = PretrainedCLAPEncoder(
         model_name=args.model_name,
         freeze=True,
     )
 
-    audio_embeddings, text_embeddings = encode_in_batches(
+    audio_embeddings, text_embeddings = encode_in_batches_clap(
         model=model,
         audio_paths=audio_paths,
         texts=texts,
         batch_size=args.batch_size,
     )
 
-    similarity = text_embeddings @ audio_embeddings.T
+    similarity = audio_embeddings @ text_embeddings.T
     similarity = similarity.numpy()
 
-    text_to_audio = retrieval_metrics(similarity)
-    audio_to_text = retrieval_metrics(similarity.T)
+    text_to_audio_relevance = transpose_sparse_relevance(
+        relevance=audio_to_text_relevance,
+        num_targets=len(texts),
+    )
+
+    audio_to_text_binary = sparse_binary_retrieval_metrics(
+        similarity=similarity,
+        relevance=audio_to_text_relevance,
+    )
+    text_to_audio_binary = sparse_binary_retrieval_metrics(
+        similarity=similarity.T,
+        relevance=text_to_audio_relevance,
+    )
+
+    validate_binary_metrics(audio_to_text_binary, "audio_to_text")
+    validate_binary_metrics(text_to_audio_binary, "text_to_audio")
 
     results = {
-        "num_samples": len(records),
+        "num_records": len(records),
+        "num_audio": len(audio_paths),
+        "num_texts": len(texts),
+        "num_positive_edges": num_positive_edges,
         "model_name": args.model_name,
-        "text_to_audio": text_to_audio,
-        "audio_to_text": audio_to_text,
+        "metric_notes": {
+            "binary": "hit/recall/mrr treat every caption attached to the same audio file as relevant.",
+            "binary_ndcg": "ndcg uses binary relevance scores because these audio datasets have no graded labels.",
+            "relevance_storage": "sparse dictionaries; dense zero-filled relevance matrix is not materialized.",
+            "balanced_pairwise": "Each positive edge is evaluated against one positive plus up to the requested sampled negatives.",
+        },
+        "audio_to_text": {
+            "binary_ndcg": sparse_compute_metrics(
+                similarity=similarity,
+                relevance=audio_to_text_relevance,
+                exponential_gain=False,
+            ),
+            "binary_retrieval": audio_to_text_binary,
+        },
+        "text_to_audio": {
+            "binary_ndcg": sparse_compute_metrics(
+                similarity=similarity.T,
+                relevance=text_to_audio_relevance,
+                exponential_gain=False,
+            ),
+            "binary_retrieval": text_to_audio_binary,
+        },
+        "balanced_pairwise": {
+            "requested_num_negatives": 999,
+            "audio_to_text": balanced_edge_retrieval_metrics(
+                similarity=similarity,
+                relevance=audio_to_text_relevance,
+                num_negatives=999,
+                seed=0,
+            ),
+            "text_to_audio": balanced_edge_retrieval_metrics(
+                similarity=similarity.T,
+                relevance=text_to_audio_relevance,
+                num_negatives=999,
+                seed=0,
+            ),
+        },
     }
 
     print(json.dumps(results, indent=2))

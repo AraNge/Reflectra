@@ -6,15 +6,14 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
+from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
 
-# Project paths
-module_dir = os.path.dirname(os.path.abspath(__file__))  # src/modules
-project_root = os.path.abspath(os.path.join(module_dir, "..", ".."))
 
-hf_cache_dir = os.path.join(project_root, "data", "hf_cache")
-image_output_dir = os.path.join(project_root, "data", "emoset_images")
+ensure_data_dirs()
 
-os.makedirs(hf_cache_dir, exist_ok=True)
+hf_cache_dir = str(HF_CACHE_DIR)
+image_output_dir = str(DATA_DIR / "emoset_images")
+
 os.makedirs(image_output_dir, exist_ok=True)
 
 
@@ -114,8 +113,7 @@ def download_emoset_samples(number: int, split: str):
 
     split_image_output_dir = os.path.join(image_output_dir, split)
     metadata_output_path = os.path.join(
-        project_root,
-        "data",
+        str(METADATA_DIR),
         f"emoset_{split}_metadata.jsonl",
     )
 
@@ -139,8 +137,6 @@ def download_emoset_samples(number: int, split: str):
             try:
                 image = get_first_image(row["images"])
                 emotion = str(row["answer"]).strip().lower()
-                problem = row["problem"]
-
                 filename = f"emoset_{split}_{idx}_{safe_filename(emotion)}.jpg"
                 file_path = os.path.join(split_image_output_dir, filename)
 
@@ -161,11 +157,8 @@ def download_emoset_samples(number: int, split: str):
 
                 metadata = {
                     "image_id": f"emoset_{split}_{idx}",
-                    "filename": filename,
                     "image_path": file_path,
-                    "emotion": emotion,
-                    "problem": problem,
-                    "music_query": make_music_query_from_emotion(emotion),
+                    "captions": [make_music_query_from_emotion(emotion)],
                     "split": split,
                     "source_dataset": "LiangJian24/EmoSet",
                 }

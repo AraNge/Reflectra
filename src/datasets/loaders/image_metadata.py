@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from src.datasets.loaders.jsonl import read_jsonl
 
 
@@ -16,8 +16,7 @@ class ImageTextMetadataLoader:
     - split
 
     Text fields:
-    - captions       # COCO / Flickr30k
-    - music_query    # EmoSet-derived music/music-mood query
+    - captions
     """
 
     def __init__(
@@ -25,12 +24,10 @@ class ImageTextMetadataLoader:
         metadata_paths: List[str | Path],
         project_root: str | Path | None = None,
         require_image_exists: bool = True,
-        expand_captions: bool = True,
     ):
         self.metadata_paths = [Path(p) for p in metadata_paths]
         self.project_root = Path(project_root).resolve() if project_root else Path.cwd()
         self.require_image_exists = require_image_exists
-        self.expand_captions = expand_captions
 
     def load(self) -> List[Dict[str, Any]]:
         records = []
@@ -65,29 +62,12 @@ class ImageTextMetadataLoader:
             "image_path": str(resolved_image_path),
             "source_dataset": str(source_dataset),
             "split": str(row.get("split", "unknown")),
-            "raw": row,
         }
 
-        records = []
-
-        records.extend(
-            self._records_from_captions(
-                row=row,
-                base_record=base_record,
-            )
-        )
-
-        music_query_record = self._record_from_single_text(
+        return self._records_from_captions(
             row=row,
             base_record=base_record,
-            field_name="music_query",
-            text_type="music_query",
         )
-
-        if music_query_record is not None:
-            records.append(music_query_record)
-
-        return records
 
     def _records_from_captions(
         self,
@@ -109,48 +89,15 @@ class ImageTextMetadataLoader:
 
         image_id = base_record["image_id"]
 
-        if self.expand_captions:
-            return [
-                {
-                    **base_record,
-                    "sample_id": f"{image_id}:caption_{idx}",
-                    "text": caption,
-                    "text_type": "caption",
-                }
-                for idx, caption in enumerate(captions)
-            ]
-
-        merged_caption = " ".join(captions)
-
         return [
             {
                 **base_record,
-                "sample_id": f"{image_id}:captions",
-                "text": merged_caption,
-                "text_type": "captions",
+                "sample_id": f"{image_id}:caption_{idx}",
+                "text": caption,
+                "text_type": "caption",
             }
+            for idx, caption in enumerate(captions)
         ]
-
-    def _record_from_single_text(
-        self,
-        row: Dict[str, Any],
-        base_record: Dict[str, Any],
-        field_name: str,
-        text_type: str,
-    ) -> Optional[Dict[str, Any]]:
-        text = self._clean_text(row.get(field_name))
-
-        if not text:
-            return None
-
-        image_id = base_record["image_id"]
-
-        return {
-            **base_record,
-            "sample_id": f"{image_id}:{text_type}",
-            "text": text,
-            "text_type": text_type,
-        }
 
     def _resolve_path(self, path_value: str) -> Path:
         path = Path(path_value)
@@ -164,18 +111,3 @@ class ImageTextMetadataLoader:
             return candidate.resolve()
 
         return path
-
-    @staticmethod
-    def _clean_text(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-
-        if isinstance(value, list):
-            value = " ".join(str(v) for v in value)
-
-        value = str(value).strip()
-
-        if not value:
-            return None
-
-        return value

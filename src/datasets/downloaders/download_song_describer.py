@@ -5,19 +5,19 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import soundfile as sf
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 from tqdm import tqdm
 
 
-# Project paths
-module_dir = os.path.dirname(os.path.abspath(__file__))  # src/modules
-project_root = os.path.abspath(os.path.join(module_dir, "..", ".."))
+from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
 
-hf_cache_dir = os.path.join(project_root, "data", "hf_cache")
-audio_output_dir = os.path.join(project_root, "data", "song_describer_audio")
-metadata_output_path = os.path.join(project_root, "data", "song_describer_metadata.jsonl")
 
-os.makedirs(hf_cache_dir, exist_ok=True)
+ensure_data_dirs()
+
+hf_cache_dir = str(HF_CACHE_DIR)
+audio_output_dir = str(DATA_DIR / "song_describer_audio")
+metadata_output_path = str(METADATA_DIR / "song_describer_metadata.jsonl")
+
 os.makedirs(audio_output_dir, exist_ok=True)
 
 
@@ -48,58 +48,66 @@ def safe_filename(value: Any) -> str:
     )
 
 
+def normalize_captions(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+
+    captions = []
+
+    for item in values:
+        text = str(item).strip()
+
+        if text:
+            captions.append(text)
+
+    return captions
+
+
+
 def get_audio_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    In this HF dataset, the audio column appears to be named 'path'.
-
-    Expected format:
-        row["path"] = {
-            "path": "...",
-            "array": np.ndarray,
-            "sampling_rate": int
-        }
+    Supports both old HF audio dict format and new torchcodec AudioDecoder format.
     """
 
-    if "path" in row and isinstance(row["path"], dict):
-        audio = row["path"]
+    audio = row.get("path")
 
+    if isinstance(audio, dict):
         if "array" in audio and "sampling_rate" in audio:
-            return audio
+            return {
+                "array": np.asarray(audio["array"]),
+                "sampling_rate": int(audio["sampling_rate"]),
+            }
 
-    # fallback: search any audio-like dict
-    for value in row.values():
-        if isinstance(value, dict) and "array" in value and "sampling_rate" in value:
-            return value
+    if hasattr(audio, "get_all_samples"):
+        try:
+            samples = audio.get_all_samples()
 
-    return None
+            array = samples.data
 
+            # torch.Tensor -> numpy
+            if hasattr(array, "detach"):
+                array = array.detach().cpu().numpy()
+            else:
+                array = np.asarray(array)
 
-def get_caption_or_description(row: Dict[str, Any]) -> Optional[str]:
-    """
-    Some versions of Song Describer may expose captions/descriptions.
-    Your shown columns do not include captions, but this keeps the script robust.
-    """
+            sampling_rate = int(samples.sample_rate)
 
-    possible_keys = [
-        "caption",
-        "description",
-        "descriptions",
-        "text",
-        "sentence",
-        "summary",
-        "prompt",
-    ]
+            return {
+                "array": array,
+                "sampling_rate": sampling_rate,
+            }
 
-    for key in possible_keys:
-        if key in row and row[key] is not None:
-            value = row[key]
-
-            if isinstance(value, list):
-                return " ".join(str(v) for v in value)
-
-            return str(value)
+        except Exception as e:
+            print(f"-> Failed to decode AudioDecoder: {e}")
+            return None
 
     return None
+
 
 
 def save_audio(audio: Dict[str, Any], output_path: str) -> bool:
@@ -110,8 +118,9 @@ def save_audio(audio: Dict[str, Any], output_path: str) -> bool:
         if array.size == 0:
             return False
 
-        # If audio is [channels, samples], convert to [samples, channels]
-        if array.ndim == 2 and array.shape[0] < array.shape[1]:
+        # torchcodec often gives [channels, samples]
+        # soundfile wants [samples, channels]
+        if array.ndim == 2 and array.shape[0] <= 8 and array.shape[0] < array.shape[1]:
             array = array.T
 
         sf.write(output_path, array, sampling_rate)
@@ -120,7 +129,7 @@ def save_audio(audio: Dict[str, Any], output_path: str) -> bool:
     except Exception as e:
         print(f"-> Failed to save audio: {e}")
         return False
-
+    
 
 def download_song_describer_samples(number: int):
     split = "train"
@@ -132,6 +141,8 @@ def download_song_describer_samples(number: int):
         split=split,
         cache_dir=hf_cache_dir,
     )
+
+    ds = ds.cast_column("path", Audio())
 
     print(f"Dataset columns: {ds.column_names}")
     print(f"Total rows in split: {len(ds)}")
@@ -153,9 +164,6 @@ def download_song_describer_samples(number: int):
                 print(f"\n[{idx + 1}/{number}] Failed: no audio field found.")
                 continue
 
-            artist_id = row.get("artist_id")
-            album_id = row.get("album_id")
-            duration = row.get("duration")
             dataset_index = row.get("__index_level_0__", idx)
 
             audio_id = f"song_describer_{dataset_index}"
@@ -167,9 +175,6 @@ def download_song_describer_samples(number: int):
                 saved_count += 1
             else:
                 print(f"\n[{idx + 1}/{number}] Saving Song Describer audio: {audio_id}")
-                print(f"-> Artist ID: {artist_id}")
-                print(f"-> Album ID: {album_id}")
-                print(f"-> Duration: {duration}")
 
                 success = save_audio(audio, file_path)
 
@@ -181,30 +186,13 @@ def download_song_describer_samples(number: int):
                 print(f"-> Saved to: {file_path}")
                 saved_count += 1
 
-            caption_or_description = get_caption_or_description(row)
-
             metadata = {
                 "audio_id": audio_id,
                 "audio_path": file_path,
-                "artist_id": artist_id,
-                "album_id": album_id,
-                "duration": duration,
-                "caption": caption_or_description,
+                "captions": [row.get("caption")],
                 "source_dataset": "renumics/song-describer-dataset",
                 "split": split,
-                "dataset_index": dataset_index,
             }
-
-            # Store all non-audio fields safely.
-            for key, value in row.items():
-                if key == "path":
-                    continue
-
-                try:
-                    json.dumps(value)
-                    metadata[key] = value
-                except TypeError:
-                    metadata[key] = str(value)
 
             meta_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
 

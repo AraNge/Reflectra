@@ -93,7 +93,7 @@ CLIP image encoder
 ↓
 image embedding
 
-caption / music query
+caption / mood caption
 ↓
 CLIP text encoder
 ↓
@@ -145,19 +145,32 @@ Downloaded files should live in the top-level `data/` directory. Python code for
 
 | Dataset | Main use | Notes |
 |---|---|---|
-| MusicCaps | Clean text-to-audio evaluation | Human-written music captions and aspect lists. Best clean benchmark for CLAP retrieval. |
-| Song Describer Dataset | Clean text-to-audio evaluation | Useful for song-level natural language descriptions when captions are available. |
-| MTG-Jamendo | Training / validation / scale evaluation | Contains audio plus metadata such as moods, genres, and instruments. |
-| AudioSet | Large-scale weak evaluation / robustness | General audio dataset. Useful for scale and hard negatives, but not a clean song-caption benchmark. |
-| LP-MusicCaps-MSD | Optional large caption dataset | Use only for audio retrieval if local audio files exist. Otherwise use captions as metadata only. |
+| MusicCaps | Clean text-to-audio evaluation | Stores the human caption plus aspect-list entries as `captions`. Best clean benchmark for CLAP retrieval. |
+| Song Describer Dataset | Clean text-to-audio evaluation | Stores available song descriptions as `captions`. |
+| MTG-Jamendo | Training / validation / scale evaluation | Builds captions from moods, genres, and instruments, then saves only the clean caption list. |
+| AudioSet | Large-scale weak evaluation / robustness | Builds one caption per human label. Useful for scale and hard negatives, but not a clean song-caption benchmark. |
 
 ### Image-text datasets
 
 | Dataset | Main use | Notes |
 |---|---|---|
-| COCO Captions | Image-text training and validation | General image-caption alignment. |
-| Flickr30k | Clean image-text evaluation | Good benchmark for image-caption retrieval. |
-| EmoSet | Image mood/music-query training | Converts visual emotion into music-oriented text queries. |
+| COCO 2014 | Image-text benchmark | General image-caption alignment using Karpathy caption metadata. |
+| Flickr30k | Clean image-text evaluation | Copies the dataset caption list into `captions`. |
+| EmoSet | Image mood alignment | Converts visual emotion into music-oriented captions. |
+
+All normal metadata JSONL rows use a small generic schema:
+
+```json
+{
+  "audio_id": "...",
+  "audio_path": "...",
+  "captions": ["..."],
+  "split": "...",
+  "source_dataset": "..."
+}
+```
+
+For image datasets, `audio_id/audio_path` are replaced by `image_id/image_path`. Loaders always expand `captions` into one training/evaluation record per caption.
 
 ---
 
@@ -169,7 +182,10 @@ Recommended structure:
 reflectra/
 ├── assets/
 │   └── logo.png
+├── configs/
+│   └── reflectra.toml
 ├── data/
+│   ├── music/
 │   ├── audio/
 │   ├── images/
 │   ├── metadata/
@@ -181,18 +197,20 @@ reflectra/
 ├── src/
 │   ├── datasets/
 │   │   ├── downloaders/
+│   │   ├── evaluation_inputs/
 │   │   ├── loaders/
 │   │   └── preprocessing/
 │   ├── evaluation/
 │   │   ├── evaluate_clap.py
 │   │   ├── evaluate_clip.py
-│   │   └── evaluate_clap_qdrant.py
+│   │   └── evaluate_clip_cxc.py
 │   ├── metrics/
 │   │   └── retrieval_metrics.py
 │   ├── models/
 │   │   ├── clap_encoder.py
 │   │   ├── clip_encoder.py
-│   │   └── image_to_clap_projection.py
+│   │   ├── projection_head.py
+│   │   └── reflectra_model.py
 │   └── vector_db/
 │       ├── qdrant_store.py
 │       └── index_clap_audio_qdrant.py
@@ -204,6 +222,7 @@ Recommended data layout:
 
 ```text
 data/
+├── music/
 ├── audio/
 │   ├── musiccaps/
 │   ├── audioset/
@@ -226,7 +245,13 @@ data/
 └── embeddings/
 ```
 
-If your current scripts read metadata directly from `data/musiccaps_metadata.jsonl`, keep that layout or update the default paths inside the evaluation scripts.
+The `data/music/` folder is for your own local music library. Dataset downloaders write benchmark/training data under the other `data/` subfolders.
+
+Default model and Qdrant settings live in:
+
+```text
+configs/reflectra.toml
+```
 
 ---
 
@@ -271,10 +296,10 @@ python -m src.evaluation.evaluate_clap
 ### 3. Run setup script
 
 ```bash
-bash scripts/setup_environment.sh
+bash setup.sh
 ```
 
-The setup script creates project directories, installs the package in editable mode, pulls the Qdrant Docker image, and starts a local Qdrant container.
+The setup script creates project directories, writes `configs/reflectra.toml` if missing, installs the package in editable mode, pulls the Qdrant Docker image, and starts a local Qdrant container.
 
 ---
 
@@ -322,7 +347,7 @@ python -m src.datasets.downloaders.download_musiccaps --number 100
 python -m src.datasets.downloaders.download_audioset --number 100
 python -m src.datasets.downloaders.download_mtg_jamendo --split train --number 100
 python -m src.datasets.downloaders.download_mtg_jamendo --split validation --number 100
-python -m src.datasets.downloaders.download_coco_captions --split train --number 100
+python -m src.datasets.downloaders.download_coco --splits val2014
 python -m src.datasets.downloaders.download_flickr30k --number 100
 python -m src.datasets.downloaders.download_emoset --split train --number 100
 python -m src.datasets.downloaders.download_emoset --split test --number 100
@@ -330,16 +355,36 @@ python -m src.datasets.downloaders.download_emoset --split test --number 100
 
 Start small first. Verify metadata and file paths before downloading large datasets.
 
+COCO has large official zip files. The downloader shows byte progress while downloading and file progress while extracting:
+
+```bash
+python -m src.datasets.downloaders.download_coco --splits train2014 val2014
+python -m src.datasets.downloaders.download_coco --splits test2014 --skip-metadata
+```
+
+For the CxC SITS CLIP benchmark, prepare the merged Karpathy+CxC metadata:
+
+```bash
+python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc --cxc-split all
+```
+
+This writes files such as:
+
+```text
+data/metadata/coco_karpathy_cxc_sits_val.json
+data/metadata/coco_karpathy_cxc_sits_test.json
+```
+
 ---
 
 ## Evaluation
 
-There are two evaluation modes:
+There are two evaluation styles:
 
-1. Dense local evaluation.
-2. Qdrant-based retrieval evaluation.
+1. Dense local evaluation for small and medium benchmark subsets.
+2. Qdrant vector search for indexing and retrieving from a local music library.
 
-Dense evaluation is useful for small clean benchmarks. Qdrant evaluation is required for large-scale retrieval because a full `500000 × 500000` similarity matrix is not practical.
+Dense evaluation computes a similarity matrix between the sampled media items and captions. Relevance is stored sparsely, so the scripts do not create a dense zero-filled relevance matrix.
 
 ---
 
@@ -369,26 +414,37 @@ python -m src.evaluation.evaluate_clap \
 The script computes:
 
 ```text
+audio → text
 text → audio
- audio → text
 ```
 
 Typical metrics:
 
 ```text
-Recall@1
-Recall@5
-Recall@10
-MRR
-Median Rank
-Mean Rank
+Binary retrieval:
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- mrr
+- median_rank
+- mean_rank
+
+Binary NDCG:
+- ndcg@1, ndcg@5, ndcg@10
+
+Balanced pairwise:
+- hit@1, hit@5, hit@10
+- mrr
+- median_rank
+- mean_rank
 ```
+
+Each audio file may have multiple captions. All captions attached to the same audio item are treated as relevant positives.
 
 ---
 
 ### 2. Evaluate CLIP: Image-to-Text
 
-This evaluates whether CLIP retrieves matching captions or music mood queries for images.
+This evaluates whether CLIP retrieves matching captions for images.
 
 ```bash
 python -m src.evaluation.evaluate_clip --max-samples 1000
@@ -398,7 +454,7 @@ Use selected dataset fractions:
 
 ```bash
 python -m src.evaluation.evaluate_clip \
-  --dataset-fractions "whyen-wang/coco_captions=0.5,nlphuji/flickr30k=0.8,LiangJian24/EmoSet=1.0" \
+  --dataset-fractions "coco_karpathy=0.5,nlphuji/flickr30k=0.8,LiangJian24/EmoSet=1.0" \
   --max-samples 50000
 ```
 
@@ -406,7 +462,7 @@ Use exact dataset counts:
 
 ```bash
 python -m src.evaluation.evaluate_clip \
-  --dataset-counts "whyen-wang/coco_captions=5000,nlphuji/flickr30k=1000,LiangJian24/EmoSet=1000"
+  --dataset-counts "coco_karpathy=5000,nlphuji/flickr30k=1000,LiangJian24/EmoSet=1000"
 ```
 
 The script computes:
@@ -416,23 +472,88 @@ image → text
 text → image
 ```
 
----
+Metrics are the same grouped binary metrics used by CLAP:
 
-### 3. Index Audio in Qdrant
+```text
+Binary retrieval:
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- mrr
+- median_rank
+- mean_rank
 
-Before Qdrant evaluation, index audio embeddings:
+Binary NDCG:
+- ndcg@1, ndcg@5, ndcg@10
 
-```bash
-python -m src.vector_db.index_clap_audio_qdrant \
-  --collection-name reflectra_audio_clap \
-  --max-samples 10000
+Balanced pairwise:
+- hit@1, hit@5, hit@10
+- mrr
+- median_rank
+- mean_rank
 ```
 
-For full indexing:
+Each image may have multiple captions. All captions attached to the same image are treated as relevant positives.
+
+---
+
+### 3. Evaluate CLIP on CxC
+
+CxC is different from the normal CLIP script because it has graded relevance labels. This evaluation stores CxC SITS scores sparsely instead of building a dense zero-filled relevance matrix.
+
+```bash
+python -m src.evaluation.evaluate_clip_cxc \
+  --metadata data/metadata/coco_karpathy_cxc_sits_val.json \
+  --image-root data/coco_images \
+  --max-images 1000
+```
+
+The script computes:
+
+```text
+image → caption
+caption → image
+```
+
+Metrics:
+
+```text
+Graded:
+- ndcg@1, ndcg@5, ndcg@10
+- ndcg@1/5/10 with exponential gain
+
+Binary view of CxC labels:
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- mrr
+- median_rank
+- mean_rank
+
+Balanced pairwise:
+- hit@1, hit@5, hit@10
+- mrr
+- median_rank
+- mean_rank
+```
+
+For binary metrics, every CxC score `> 0` is treated as relevant.
+
+---
+
+### 4. Index Your Music in Qdrant
+
+Put local music files under `data/music/`, or pass any folder with `--music-dir`.
 
 ```bash
 python -m src.vector_db.index_clap_audio_qdrant \
-  --collection-name reflectra_audio_clap
+  --music-dir data/music
+```
+
+Index another folder:
+
+```bash
+python -m src.vector_db.index_clap_audio_qdrant \
+  --music-dir /path/to/my/music \
+  --collection-name reflectra_music_clap
 ```
 
 Each indexed audio point should contain payload fields like:
@@ -441,47 +562,70 @@ Each indexed audio point should contain payload fields like:
 {
   "audio_id": "...",
   "audio_path": "...",
-  "text": "...",
-  "source_dataset": "...",
-  "split": "..."
+  "relative_path": "...",
+  "filename": "...",
+  "stem": "...",
+  "extension": "...",
+  "source": "local_music_library"
 }
 ```
 
----
-
+Defaults such as CLAP model name, Qdrant URL, collection name, vector size, batch size, and audio extensions come from `configs/reflectra.toml`. CLI arguments override the config.
 
 ## Metrics
 
-For one-correct-target evaluation, Recall@K can be computed as whether the correct item appears in the top K.
-
-For professional retrieval evaluation with multiple relevant items, use:
+Normal CLIP and CLAP evaluation uses grouped sparse relevance:
 
 ```text
-Recall@K = number of relevant retrieved items in top K / total number of relevant items
-Precision@K = number of relevant retrieved items in top K / K
-HitRate@K = 1 if at least one relevant item is in top K, else 0
-MRR = reciprocal rank of the first relevant result
-MAP@K = average precision over the ranked top K list
-NDCG@K = ranking quality with stronger reward for relevant items near the top
+python -m src.evaluation.evaluate_clap
+python -m src.evaluation.evaluate_clip
 ```
+
+In this setup, each media item can have one or more captions. The scripts build unique media targets, unique text targets, and sparse positive links:
+
+```text
+hit@K = 1 if at least one relevant target appears in top K, else 0
+recall@K = relevant retrieved items in top K / total relevant items
+mrr = reciprocal rank of the first relevant target
+median_rank = median first-relevant rank
+mean_rank = mean first-relevant rank
+ndcg@K = ranking quality with relevant items rewarded near the top
+```
+
+CxC evaluation uses graded sparse relevance:
+
+```text
+python -m src.evaluation.evaluate_clip_cxc
+```
+
+CxC SITS has graded scores. For NDCG it uses the raw CxC score as relevance. For binary retrieval metrics, every CxC score `> 0` is treated as relevant.
+
+Balanced pairwise metrics are also reported. Each positive edge is evaluated against one positive plus up to the requested number of sampled negatives. If the target set is smaller than the requested candidate count, the script reports the actual candidate count used.
 
 Recommended reporting:
 
 ```text
-Text-to-audio:
-- Recall@1
-- Recall@5
-- Recall@10
-- MRR
-- NDCG@10
+CLAP grouped text-to-audio / audio-to-text:
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- ndcg@1, ndcg@5, ndcg@10
+- mrr, median_rank, mean_rank
 
-Image-to-text:
-- Recall@1
-- Recall@5
-- Recall@10
-- MRR
+CLIP grouped image-to-text / text-to-image:
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- ndcg@1, ndcg@5, ndcg@10
+- mrr, median_rank, mean_rank
 
-Image-to-music final system:
+CLIP CxC:
+- ndcg@1
+- ndcg@5
+- ndcg@10
+- hit@1, hit@5, hit@10
+- recall@1, recall@5, recall@10
+- mrr
+
+Image-to-music final system, later:
 - Precision@10 by mood/genre metadata
 - NDCG@10
 - Human rating from 1 to 5
@@ -513,7 +657,7 @@ python -m src.evaluation.evaluate_clip --max-samples 1000
 Purpose:
 
 ```text
-Measure whether CLIP aligns images with captions and music-oriented mood queries.
+Measure whether CLIP aligns images with captions and music-oriented mood captions.
 ```
 
 ---
@@ -528,9 +672,9 @@ Recommended order:
 3. Download a small sample from each dataset.
 4. Run CLAP dense evaluation.
 5. Run CLIP dense evaluation.
-6. Index CLAP audio embeddings in Qdrant.
-7. Run CLAP Qdrant evaluation.
-8. Scale to larger samples.
+6. Put local songs in `data/music`.
+7. Index local music CLAP audio embeddings in Qdrant.
+8. Scale to a larger music library.
 9. Train image-to-CLAP projection only after baselines work.
 10. Build final image-to-song demo.
 ```
@@ -545,5 +689,28 @@ Recommended order:
 - Use MTG-Jamendo for training, validation, and scale experiments.
 - Use AudioSet carefully because it is weakly labeled general audio, not a clean music-caption dataset.
 - Use COCO and Flickr30k for image-caption evaluation.
-- Use EmoSet for image mood/music-query alignment.
-- Use Qdrant only after small local retrieval works correctly.
+- Use EmoSet for image mood alignment through music-oriented captions.
+- Use Qdrant only after small local dense retrieval works correctly.
+
+## Dataset Links
+
+Audio-text datasets:
+
+- MusicCaps: https://huggingface.co/datasets/google/MusicCaps
+- Song Describer Dataset: https://huggingface.co/datasets/renumics/song-describer-dataset
+- MTG-Jamendo Hugging Face mirror: https://huggingface.co/datasets/rkstgr/mtg-jamendo
+- MTG-Jamendo original project: https://github.com/MTG/mtg-jamendo-dataset
+- AudioSet Hugging Face mirror: https://huggingface.co/datasets/agkphysics/AudioSet
+- AudioSet original project: https://research.google.com/audioset/
+
+Image-text / image-mood datasets:
+
+- Flickr30k Hugging Face mirror: https://huggingface.co/datasets/nlphuji/flickr30k
+- EmoSet: https://huggingface.co/datasets/LiangJian24/EmoSet
+- COCO dataset downloads: https://cocodataset.org/#download
+
+- CxC SITS labels: https://github.com/google-research-datasets/Crisscrossed-Captions
+- COCO 2014 train images: http://images.cocodataset.org/zips/train2014.zip
+- COCO 2014 validation images: http://images.cocodataset.org/zips/val2014.zip
+- COCO 2014 test images: http://images.cocodataset.org/zips/test2014.zip
+- Karpathy COCO caption metadata: http://cs.stanford.edu/people/karpathy/deepimagesent/coco.zip

@@ -6,16 +6,15 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
+from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
 
-# Project paths
-module_dir = os.path.dirname(os.path.abspath(__file__))  # src/modules
-project_root = os.path.abspath(os.path.join(module_dir, "..", ".."))
 
-hf_cache_dir = os.path.join(project_root, "data", "hf_cache")
-image_output_dir = os.path.join(project_root, "data", "flickr30k_images")
-metadata_output_path = os.path.join(project_root, "data", "flickr30k_metadata.jsonl")
+ensure_data_dirs()
 
-os.makedirs(hf_cache_dir, exist_ok=True)
+hf_cache_dir = str(HF_CACHE_DIR)
+image_output_dir = str(DATA_DIR / "flickr30k_images")
+metadata_output_path = str(METADATA_DIR / "flickr30k_metadata.jsonl")
+
 os.makedirs(image_output_dir, exist_ok=True)
 
 
@@ -203,8 +202,7 @@ def download_flickr30k_samples(number: int):
                 saved_count += 1
 
             metadata = {
-                "image_id": row.get("img_id", None),
-                "filename": filename,
+                "image_id": str(row.get("img_id") or os.path.splitext(filename)[0]),
                 "image_path": file_path,
                 "captions": captions,
                 "split": split,

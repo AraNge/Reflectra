@@ -64,7 +64,7 @@ def sample_by_dataset_fractions(
     """
     Example:
         fractions = {
-            "whyen-wang/coco_captions": 0.5,
+            "coco_karpathy": 0.5,
             "nlphuji/flickr30k": 0.8,
             "LiangJian24/EmoSet": 1.0,
         }
@@ -94,7 +94,7 @@ def sample_by_dataset_counts(
     """
     Example:
         counts = {
-            "whyen-wang/coco_captions": 50000,
+            "coco_karpathy": 50000,
             "nlphuji/flickr30k": 10000,
         }
     """

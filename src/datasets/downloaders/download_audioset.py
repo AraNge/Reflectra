@@ -8,16 +8,14 @@ import soundfile as sf
 from datasets import load_dataset
 from tqdm import tqdm
 
+from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
 
-# Project paths
-module_dir = os.path.dirname(os.path.abspath(__file__))  # src/modules
-project_root = os.path.abspath(os.path.join(module_dir, "..", ".."))
 
-hf_cache_dir = os.path.join(project_root, "data", "hf_cache")
-audio_output_dir = os.path.join(project_root, "data", "audioset_audio")
-metadata_output_path = os.path.join(project_root, "data", "audioset_metadata.jsonl")
+ensure_data_dirs()
 
-os.makedirs(hf_cache_dir, exist_ok=True)
+hf_cache_dir = str(HF_CACHE_DIR)
+audio_output_dir = str(DATA_DIR / "audioset_audio")
+
 os.makedirs(audio_output_dir, exist_ok=True)
 
 
@@ -124,6 +122,14 @@ def is_music_related(human_labels: List[str]) -> bool:
     return any(keyword in label_text for keyword in MUSIC_KEYWORDS)
 
 
+def make_captions_from_labels(labels: List[str]) -> List[str]:
+    return [
+        f"An audio clip with label: {str(label)}."
+        for label in labels
+        if str(label).strip()
+    ]
+
+
 def save_audio(audio: Dict[str, Any], output_path: str) -> bool:
     try:
         array = np.asarray(audio["array"])
@@ -160,8 +166,7 @@ def download_audioset_samples(number: int, subset: str, split: str):
 
     subset_output_dir = os.path.join(audio_output_dir, subset)
     subset_metadata_path = os.path.join(
-        project_root,
-        "data",
+        str(METADATA_DIR),
         f"audioset_{subset}_metadata.jsonl",
     )
 
@@ -215,9 +220,8 @@ def download_audioset_samples(number: int, subset: str, split: str):
             metadata = {
                 "audio_id": video_id,
                 "audio_path": file_path,
-                "human_labels": human_labels,
+                "captions": make_captions_from_labels(human_labels),
                 "source_dataset": "agkphysics/AudioSet",
-                "subset": subset,
                 "split": split,
             }
 

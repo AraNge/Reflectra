@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.datasets.torch_datasets.projection_dataset import (
+    DEFAULT_IMAGE_METADATA_PATHS,
     load_projection_records,
     create_projection_dataloaders,
 )
@@ -19,14 +20,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 RESULTS_DIR = PROJECT_ROOT / "results"
-
-
-DEFAULT_IMAGE_METADATA_PATHS = [
-    DATA_DIR / "coco_captions_metadata.jsonl",
-    DATA_DIR / "flickr30k_metadata.jsonl",
-    DATA_DIR / "emoset_train_metadata.jsonl",
-    DATA_DIR / "emoset_test_metadata.jsonl",
-]
 
 
 
@@ -206,14 +199,14 @@ def parse_args():
         "--dataset-fractions",
         type=str,
         default=None,
-        help='Example: "whyen-wang/coco_captions=0.5,nlphuji/flickr30k=0.8,LiangJian24/EmoSet=1.0"',
+        help='Example: "coco_karpathy=0.5,nlphuji/flickr30k=0.8,LiangJian24/EmoSet=1.0"',
     )
 
     parser.add_argument(
         "--dataset-counts",
         type=str,
         default=None,
-        help='Example: "whyen-wang/coco_captions=50000,nlphuji/flickr30k=10000,LiangJian24/EmoSet=5000"',
+        help='Example: "coco_karpathy=50000,nlphuji/flickr30k=10000,LiangJian24/EmoSet=5000"',
     )
 
     parser.add_argument("--num-workers", type=int, default=0)
@@ -378,7 +371,7 @@ python -m src.training.train_projection \
 
 python -m src.training.train_projection \
   --projection-type mlp \
-  --dataset-counts "whyen-wang/coco_captions=50000,LiangJian24/EmoSet=5000" \
+  --dataset-counts "coco_karpathy=50000,LiangJian24/EmoSet=5000" \
   --max-train-samples 55000 \
   --epochs 10 \
   --batch-size 32

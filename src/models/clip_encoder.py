@@ -142,9 +142,15 @@ class PretrainedCLIPEncoder(torch.nn.Module):
             padding=True,
         )
 
-        inputs = {k: v.to(self.device_name) for k, v in inputs.items()}
+        pixel_values = inputs["pixel_values"].to(self.device_name)
 
-        image_features = self.model.get_image_features(**inputs)
+        outputs = self.model.vision_model(
+            pixel_values=pixel_values,
+            return_dict=True,
+        )
+
+        pooled_output = outputs.pooler_output
+        image_features = self.model.visual_projection(pooled_output)
 
         if normalize:
             image_features = F.normalize(image_features, p=2, dim=-1)
@@ -174,7 +180,14 @@ class PretrainedCLIPEncoder(torch.nn.Module):
 
         inputs = {k: v.to(self.device_name) for k, v in inputs.items()}
 
-        text_features = self.model.get_text_features(**inputs)
+        outputs = self.model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+            return_dict=True,
+        )
+
+        pooled_output = outputs.pooler_output
+        text_features = self.model.text_projection(pooled_output)
 
         if normalize:
             text_features = F.normalize(text_features, p=2, dim=-1)

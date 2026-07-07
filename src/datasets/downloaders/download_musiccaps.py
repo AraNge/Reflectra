@@ -4,17 +4,15 @@ import argparse
 import subprocess
 from datasets import load_dataset
 
+from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
 
-# Find project directory roots
-module_dir = os.path.dirname(os.path.abspath(__file__))  # src/modules
-project_root = os.path.abspath(os.path.join(module_dir, "..", ".."))  # REFLECTION
 
-# Define centralized parent data directories
-hf_cache_dir = os.path.join(project_root, "data", "hf_cache")
-audio_output_dir = os.path.join(project_root, "data", "musiccaps_audio")
-metadata_output_path = os.path.join(project_root, "data", "musiccaps_metadata.jsonl")
+ensure_data_dirs()
 
-os.makedirs(hf_cache_dir, exist_ok=True)
+hf_cache_dir = str(HF_CACHE_DIR)
+audio_output_dir = str(DATA_DIR / "musiccaps_audio")
+metadata_output_path = str(METADATA_DIR / "musiccaps_metadata.jsonl")
+
 os.makedirs(audio_output_dir, exist_ok=True)
 
 
@@ -40,18 +38,37 @@ def download_clip(ytid, start_s, end_s, output_path):
         return False
 
 
-def write_metadata_row(meta_file, row, audio_id, file_path, status):
+def normalize_text_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+
+    captions = []
+
+    for item in values:
+        text = str(item).strip()
+
+        if text:
+            captions.append(text)
+
+    return captions
+
+
+def build_captions(row):
+    return normalize_text_list(row["caption"]) + normalize_text_list(row["aspect_list"])
+
+
+def write_metadata_row(meta_file, row, audio_id, file_path):
     metadata = {
         "audio_id": audio_id,
-        "youtube_url": f"https://www.youtube.com/watch?v={row['ytid']}",
-        "start_s": row["start_s"],
-        "end_s": row["end_s"],
         "audio_path": file_path,
-        "caption": row["caption"],
-        "aspect_list": row["aspect_list"],
+        "captions": build_captions(row),
         "source_dataset": "google/MusicCaps",
         "split": "train",
-        "status": status,
     }
 
     meta_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
@@ -99,7 +116,6 @@ def download_musiccaps_samples(num_samples: int):
                     row=row,
                     audio_id=audio_id,
                     file_path=file_path,
-                    status="already_exists",
                 )
                 continue
 
@@ -116,7 +132,6 @@ def download_musiccaps_samples(num_samples: int):
                     row=row,
                     audio_id=audio_id,
                     file_path=file_path,
-                    status="downloaded",
                 )
             else:
                 failed_count += 1

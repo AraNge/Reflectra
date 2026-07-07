@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.datasets.loaders.jsonl import read_jsonl
 
@@ -16,12 +16,8 @@ class AudioMetadataLoader:
     Optional:
     - split
 
-    Text fields priority:
-    1. caption
-    2. human_labels
-    3. moods
-    4. aspect_list
-    5. genres + instruments
+    Text fields:
+    - captions
     """
 
     def __init__(
@@ -45,39 +41,44 @@ class AudioMetadataLoader:
             rows = read_jsonl(metadata_path)
 
             for row in rows:
-                record = self._normalize_row(row)
-
-                if record is not None:
-                    records.append(record)
+                records.extend(self._normalize_row(row))
 
         return records
 
-    def _normalize_row(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _normalize_row(self, row: Dict[str, Any]) -> List[Dict[str, Any]]:
         audio_id = row.get("audio_id")
         audio_path = row.get("audio_path")
         source_dataset = row.get("source_dataset")
 
         if not audio_id or not audio_path or not source_dataset:
-            return None
+            return []
 
         resolved_audio_path = self._resolve_path(audio_path)
 
         if self.require_audio_exists and not resolved_audio_path.exists():
-            return None
+            return []
 
-        text = self._extract_text(row)
+        captions = self._extract_captions(row)
 
-        if not text:
-            return None
+        if not captions:
+            return []
 
-        return {
+        base_record = {
             "audio_id": str(audio_id),
             "audio_path": str(resolved_audio_path),
-            "text": text,
             "source_dataset": str(source_dataset),
             "split": str(row.get("split", "")),
-            "raw": row,
         }
+
+        return [
+            {
+                **base_record,
+                "sample_id": f"{audio_id}:caption_{caption_idx}",
+                "text": caption,
+                "text_type": "caption",
+            }
+            for caption_idx, caption in enumerate(captions)
+        ]
 
     def _resolve_path(self, path_value: str) -> Path:
         path = Path(path_value)
@@ -92,62 +93,23 @@ class AudioMetadataLoader:
 
         return path
 
-    def _extract_text(self, row: Dict[str, Any]) -> Optional[str]:
-        # 1. caption
-        caption = self._clean_text(row.get("caption"))
-        if caption:
-            return caption
-
-        # 2. human_labels
-        human_labels = row.get("human_labels")
-        if human_labels:
-            return f"An audio clip with human labels: {self._list_to_text(human_labels)}."
-
-        # 3. moods
-        moods = row.get("moods")
-        if moods:
-            return f"A music track with moods: {self._list_to_text(moods)}."
-
-        # 4. aspect_list
-        aspect_list = row.get("aspect_list")
-        if aspect_list:
-            return f"A music clip described by aspects: {self._list_to_text(aspect_list)}."
-
-        # 5. genres + instruments
-        genres = row.get("genres")
-        instruments = row.get("instruments")
-
-        if genres or instruments:
-            parts = []
-
-            if genres:
-                parts.append(f"genres: {self._list_to_text(genres)}")
-
-            if instruments:
-                parts.append(f"instruments: {self._list_to_text(instruments)}")
-
-            return "A music track with " + "; ".join(parts) + "."
-
-        return None
+    def _extract_captions(self, row: Dict[str, Any]) -> List[str]:
+        return self._clean_list(row.get("captions"))
 
     @staticmethod
-    def _clean_text(value: Any) -> Optional[str]:
+    def _clean_list(value: Any) -> List[str]:
         if value is None:
-            return None
+            return []
 
-        if isinstance(value, list):
-            value = " ".join(str(v) for v in value)
+        if not isinstance(value, list):
+            value = [value]
 
-        value = str(value).strip()
+        captions = []
 
-        if not value:
-            return None
+        for item in value:
+            text = str(item).strip()
 
-        return value
+            if text:
+                captions.append(text)
 
-    @staticmethod
-    def _list_to_text(value: Any) -> str:
-        if isinstance(value, list):
-            return ", ".join(str(v) for v in value)
-
-        return str(value)
+        return captions

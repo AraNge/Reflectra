@@ -1,0 +1,13 @@
+[models]
+clip = "openai/clip-vit-base-patch32"
+clap = "laion/clap-htsat-unfused"
+
+[qdrant]
+url = "http://localhost:6333"
+collection_name = "reflectra_music_clap"
+vector_size = 512
+
+[audio_index]
+music_dir = "data/music"
+batch_size = 8
+extensions = [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]
