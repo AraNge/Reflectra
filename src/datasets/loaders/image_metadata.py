@@ -1,23 +1,10 @@
 from pathlib import Path
 from typing import Any, Dict, List
-from src.datasets.loaders.jsonl import read_jsonl
+from src.utils.json import read_jsonl
 
 
 class ImageTextMetadataLoader:
-    """
-    Loads image-text metadata for CLIP training/evaluation.
-
-    Common required fields:
-    - image_id
-    - image_path
-    - source_dataset
-
-    Optional:
-    - split
-
-    Text fields:
-    - captions
-    """
+    """Load one normalized record per image ID with merged captions."""
 
     def __init__(
         self,
@@ -30,84 +17,90 @@ class ImageTextMetadataLoader:
         self.require_image_exists = require_image_exists
 
     def load(self) -> List[Dict[str, Any]]:
-        records = []
+        by_image_id: Dict[str, Dict[str, Any]] = {}
 
         for metadata_path in self.metadata_paths:
             if not metadata_path.exists():
                 print(f"[WARN] Metadata file not found, skipping: {metadata_path}")
                 continue
 
-            rows = read_jsonl(metadata_path)
+            for row in read_jsonl(metadata_path):
+                record = self._normalize_row(row)
+                if record is None:
+                    continue
 
-            for row in rows:
-                records.extend(self._normalize_row(row))
+                image_id = record["image_id"]
+                existing = by_image_id.get(image_id)
+                if existing is None:
+                    by_image_id[image_id] = record
+                    continue
 
-        return records
+                self._validate_same_media(existing, record)
+                existing["captions"] = self._merge_unique(
+                    existing["captions"], record["captions"]
+                )
 
-    def _normalize_row(self, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return list(by_image_id.values())
+
+    def _normalize_row(self, row: Dict[str, Any]) -> Dict[str, Any] | None:
         image_id = row.get("image_id")
         image_path = row.get("image_path")
         source_dataset = row.get("source_dataset")
 
         if not image_id or not image_path or not source_dataset:
-            return []
+            return None
 
-        resolved_image_path = self._resolve_path(image_path)
-
+        resolved_image_path = self._resolve_path(str(image_path))
         if self.require_image_exists and not resolved_image_path.exists():
-            return []
+            return None
 
-        base_record = {
+        captions = self._clean_list(row.get("captions"))
+        if not captions:
+            return None
+
+        return {
             "image_id": str(image_id),
+            "captions": captions,
             "image_path": str(resolved_image_path),
             "source_dataset": str(source_dataset),
             "split": str(row.get("split", "unknown")),
+            "source_image_id": str(row.get("source_image_id", image_id)),
         }
 
-        return self._records_from_captions(
-            row=row,
-            base_record=base_record,
-        )
-
-    def _records_from_captions(
-        self,
-        row: Dict[str, Any],
-        base_record: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        captions = row.get("captions")
-
-        if not captions:
-            return []
-
-        if isinstance(captions, str):
-            captions = [captions]
-
-        captions = [str(c).strip() for c in captions if str(c).strip()]
-
-        if not captions:
-            return []
-
-        image_id = base_record["image_id"]
-
-        return [
-            {
-                **base_record,
-                "sample_id": f"{image_id}:caption_{idx}",
-                "text": caption,
-                "text_type": "caption",
-            }
-            for idx, caption in enumerate(captions)
-        ]
+    @staticmethod
+    def _validate_same_media(existing: Dict[str, Any], new: Dict[str, Any]) -> None:
+        for field in ("image_path", "source_dataset", "split"):
+            if existing[field] != new[field]:
+                raise ValueError(
+                    f"Conflicting {field} for image_id={existing['image_id']}: "
+                    f"{existing[field]!r} != {new[field]!r}"
+                )
 
     def _resolve_path(self, path_value: str) -> Path:
         path = Path(path_value)
-
         if path.exists():
             return path.resolve()
 
         candidate = self.project_root / path_value
-
         if candidate.exists():
             return candidate.resolve()
 
         return path
+
+    @staticmethod
+    def _clean_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        return ImageTextMetadataLoader._merge_unique([], [str(v).strip() for v in value])
+
+    @staticmethod
+    def _merge_unique(left: List[str], right: List[str]) -> List[str]:
+        seen = set(left)
+        merged = list(left)
+        for item in right:
+            if item and item not in seen:
+                seen.add(item)
+                merged.append(item)
+        return merged

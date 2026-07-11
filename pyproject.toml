@@ -13,11 +13,14 @@ dependencies = [
     "qdrant-client",
     "numpy",
     "librosa",
+    "soundfile",
     "pillow",
     "tqdm",
     "datasets",
     "yt-dlp",
-    "torchcodec"
+    "torchcodec",
+    "openai",
+    "soundfile"
 ]
 
 [build-system]
@@ -27,4 +30,5 @@ build-backend = "hatchling.build"
 [project.scripts]
 reflectra-evaluate-clap = "src.evaluation.evaluate_clap:main"
 reflectra-evaluate-clip = "src.evaluation.evaluate_clip:main"
+reflectra-evaluate-reflectra = "src.evaluation.evaluate_reflectra:main"
 reflectra-index-audio-qdrant = "src.vector_db.index_clap_audio_qdrant:main"

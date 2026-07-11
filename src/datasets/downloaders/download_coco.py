@@ -7,7 +7,6 @@ import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Iterable
 
 from tqdm import tqdm
 
@@ -18,11 +17,8 @@ from src.datasets.preprocessing.coco_karpathy import (
 from src.datasets.paths import DATA_DIR, METADATA_DIR, PROJECT_ROOT, ensure_data_dirs
 
 
-COCO_IMAGE_URLS = {
-    "train2014": "http://images.cocodataset.org/zips/train2014.zip",
-    "val2014": "http://images.cocodataset.org/zips/val2014.zip",
-    "test2014": "http://images.cocodataset.org/zips/test2014.zip",
-}
+COCO_SPLIT = "val2014"
+COCO_IMAGE_URL = "http://images.cocodataset.org/zips/val2014.zip"
 
 KARPATHY_METADATA_URL = "http://cs.stanford.edu/people/karpathy/deepimagesent/coco.zip"
 KARPATHY_JSON_NAME = "dataset_coco.json"
@@ -35,7 +31,7 @@ CAPTIONS_METADATA_PATH = METADATA_DIR / "coco_captions_metadata.jsonl"
 
 TMP_DIR = Path(tempfile.gettempdir()) / "reflectra_cxc"
 CXC_REPO_DIR = TMP_DIR / "Crisscrossed-Captions"
-DEFAULT_CXC_OUTPUT_PREFIX = METADATA_DIR / "coco_karpathy_cxc_sits"
+DEFAULT_CXC_OUTPUT_PATH = METADATA_DIR / "coco_karpathy_cxc_sits_val.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,17 +40,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--splits",
-        nargs="+",
-        default=["val2014"],
-        choices=sorted(COCO_IMAGE_URLS),
-        help="COCO image zip splits to download. Default: val2014.",
-    )
-
-    parser.add_argument(
         "--skip-images",
         action="store_true",
-        help="Download/prepare metadata only.",
+        help="Download/prepare metadata only. COCO images are val2014 only.",
     )
 
     parser.add_argument(
@@ -76,14 +64,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--cxc-split",
-        type=str,
-        default="all",
-        choices=["val", "test", "all"],
-        help="CxC SITS split to merge when --prepare-cxc is used. Default: all.",
-    )
-
-    parser.add_argument(
         "--coco-input",
         type=str,
         default=None,
@@ -94,10 +74,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--cxc-output-prefix",
+        "--cxc-output",
         type=str,
-        default=str(DEFAULT_CXC_OUTPUT_PREFIX),
-        help="CxC output prefix. For all splits, outputs *_val.json and *_test.json.",
+        default=str(DEFAULT_CXC_OUTPUT_PATH),
+        help="CxC val output path.",
     )
 
     parser.add_argument(
@@ -214,18 +194,16 @@ def run_command(command: list[str], cwd: Path | None = None) -> None:
     )
 
 
-def download_coco_images(splits: Iterable[str], force: bool = False) -> None:
-    for split in splits:
-        url = COCO_IMAGE_URLS[split]
-        zip_path = DOWNLOAD_DIR / f"{split}.zip"
+def download_coco_images(force: bool = False) -> None:
+    zip_path = DOWNLOAD_DIR / f"{COCO_SPLIT}.zip"
 
-        download_file(url=url, output_path=zip_path, force=force)
-        extract_zip(
-            zip_path=zip_path,
-            output_dir=IMAGE_ROOT,
-            marker_name=f".{split}.extracted",
-            force=force,
-        )
+    download_file(url=COCO_IMAGE_URL, output_path=zip_path, force=force)
+    extract_zip(
+        zip_path=zip_path,
+        output_dir=IMAGE_ROOT,
+        marker_name=f".{COCO_SPLIT}.extracted",
+        force=force,
+    )
 
 
 def download_karpathy_metadata(force: bool = False) -> Path:
@@ -315,61 +293,38 @@ def get_cxc_sits_file(split: str) -> Path:
     return path
 
 
-def get_cxc_splits_to_run(split: str) -> list[str]:
-    if split == "all":
-        return ["val", "test"]
-
-    return [split]
-
-
-def cxc_output_path_for_split(output_prefix: Path, split: str, total_splits: int) -> Path:
-    if total_splits == 1:
-        return output_prefix.with_suffix(".json")
-
-    return output_prefix.parent / f"{output_prefix.name}_{split}.json"
-
-
 def prepare_cxc_sits(
     coco_input: Path,
-    split: str,
-    output_prefix: Path,
+    output_path: Path,
     force_cxc: bool = False,
     clear_tmp: bool = False,
 ) -> None:
     clone_or_update_cxc_repo(force=force_cxc)
 
-    output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    splits = get_cxc_splits_to_run(split)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     setup_file = find_cxc_setup_file()
+    cxc_input = get_cxc_sits_file("val")
 
-    for cxc_split in splits:
-        cxc_input = get_cxc_sits_file(cxc_split)
-        output_json = cxc_output_path_for_split(
-            output_prefix=output_prefix,
-            split=cxc_split,
-            total_splits=len(splits),
-        )
+    print("\nPreparing CxC SITS split: val")
+    print(f"COCO input: {coco_input}")
+    print(f"CxC input: {cxc_input}")
+    print(f"Output: {output_path}")
 
-        print(f"\nPreparing CxC SITS split: {cxc_split}")
-        print(f"COCO input: {coco_input}")
-        print(f"CxC input: {cxc_input}")
-        print(f"Output: {output_json}")
+    run_command(
+        [
+            sys.executable,
+            str(setup_file),
+            "--coco_input",
+            str(coco_input),
+            "--cxc_input",
+            str(cxc_input),
+            "--output",
+            str(output_path),
+        ],
+        cwd=CXC_REPO_DIR,
+    )
 
-        run_command(
-            [
-                sys.executable,
-                str(setup_file),
-                "--coco_input",
-                str(coco_input),
-                "--cxc_input",
-                str(cxc_input),
-                "--output",
-                str(output_json),
-            ],
-            cwd=CXC_REPO_DIR,
-        )
-
-        validate_cxc_output(output_json)
+    validate_cxc_output(output_path)
 
     if clear_tmp and TMP_DIR.exists():
         print(f"\nClearing temporary CxC directory: {TMP_DIR}")
@@ -408,7 +363,7 @@ def main() -> None:
     metadata_json = None
 
     if not args.skip_images:
-        download_coco_images(splits=args.splits, force=args.force)
+        download_coco_images(force=args.force)
 
     if not args.skip_metadata:
         if args.coco_input:
@@ -434,15 +389,14 @@ def main() -> None:
             else:
                 metadata_json = download_karpathy_metadata(force=args.force)
 
-        output_prefix = Path(args.cxc_output_prefix).expanduser()
+        output_path = Path(args.cxc_output).expanduser()
 
-        if not output_prefix.is_absolute():
-            output_prefix = PROJECT_ROOT / output_prefix
+        if not output_path.is_absolute():
+            output_path = PROJECT_ROOT / output_path
 
         prepare_cxc_sits(
             coco_input=metadata_json.resolve(),
-            split=args.cxc_split,
-            output_prefix=output_prefix.resolve(),
+            output_path=output_path.resolve(),
             force_cxc=args.force_cxc,
             clear_tmp=args.clear_cxc_tmp,
         )
@@ -451,10 +405,9 @@ def main() -> None:
 
 
 """
-python -m src.datasets.downloaders.download_coco --splits val2014
-python -m src.datasets.downloaders.download_coco --splits train2014 val2014
-python -m src.datasets.downloaders.download_coco --splits test2014 --skip-metadata
-python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc --cxc-split all
+python -m src.datasets.downloaders.download_coco
+python -m src.datasets.downloaders.download_coco --skip-metadata
+python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc
 """
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
-def resolve_image_path(image_root: Path, example: Dict[str, Any]) -> Path | None:
-    filename = example.get("filename")
-    filepath = example.get("filepath")
+def find_image_file(image_root: Path, image_record: Dict[str, Any]) -> Path | None:
+    filename = image_record.get("filename")
+    filepath = image_record.get("filepath")
 
     if not filename:
         return None
@@ -40,7 +40,7 @@ def resolve_image_path(image_root: Path, example: Dict[str, Any]) -> Path | None
     return None
 
 
-def load_cxc_image_caption_records(
+def load_cxc_sits_retrieval_data(
     metadata_path: Path,
     image_root: Path,
     max_images: int | None = None,
@@ -54,8 +54,8 @@ def load_cxc_image_caption_records(
         relevance: one dict per image query, mapping caption index -> CxC score
     """
 
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with open(metadata_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
 
     images = data["images"]
 
@@ -63,71 +63,71 @@ def load_cxc_image_caption_records(
     captions: List[str] = []
 
     image_index_by_filename: Dict[str, int] = {}
-    caption_index_by_sentid: Dict[int, int] = {}
+    caption_index_by_sentence_id: Dict[int, int] = {}
 
-    selected_examples: List[Dict[str, Any]] = []
+    selected_records: List[Dict[str, Any]] = []
 
     missing_count = 0
     no_cxc_count = 0
 
-    for example in images:
-        if "cxc_scores" not in example:
+    for image_record in images:
+        if "cxc_scores" not in image_record:
             no_cxc_count += 1
             continue
 
-        image_path = resolve_image_path(image_root, example)
+        image_path = find_image_file(image_root, image_record)
 
         if image_path is None:
             missing_count += 1
             continue
 
-        filename = str(example["filename"])
+        filename = str(image_record["filename"])
 
         if filename in image_index_by_filename:
             continue
 
         image_index_by_filename[filename] = len(image_paths)
         image_paths.append(str(image_path))
-        selected_examples.append(example)
+        selected_records.append(image_record)
 
-        for sentence in example.get("sentences", []):
-            sentid = sentence.get("sentid")
-            raw = sentence.get("raw")
+        for sentence in image_record.get("sentences", []):
+            sentence_id = sentence.get("sentid")
+            caption = sentence.get("raw")
 
-            if sentid is None or not raw:
+            if sentence_id is None or not caption:
                 continue
 
-            sentid = int(sentid)
+            sentence_id = int(sentence_id)
 
-            if sentid not in caption_index_by_sentid:
-                caption_index_by_sentid[sentid] = len(captions)
-                captions.append(str(raw).strip())
+            if sentence_id not in caption_index_by_sentence_id:
+                caption_index_by_sentence_id[sentence_id] = len(captions)
+                captions.append(str(caption).strip())
 
         if max_images is not None and len(image_paths) >= max_images:
             break
 
     relevance: List[Dict[int, float]] = [{} for _ in image_paths]
 
-    for example in selected_examples:
-        filename = str(example["filename"])
+    for image_record in selected_records:
+        filename = str(image_record["filename"])
         image_idx = image_index_by_filename[filename]
 
-        for item in example.get("cxc_scores", []):
+        for item in image_record.get("cxc_scores", []):
             if len(item) != 3:
                 continue
 
-            target_id, score, rating_type = item
+            target_id, score, _rating_type = item
 
             try:
-                sentid = int(target_id)
+                sentence_id = int(target_id)
                 score = float(score)
             except Exception:
                 continue
 
-            if sentid not in caption_index_by_sentid:
+            if sentence_id not in caption_index_by_sentence_id:
                 continue
 
-            caption_idx = caption_index_by_sentid[sentid]
+            caption_idx = caption_index_by_sentence_id[sentence_id]
             previous_score = relevance[image_idx].get(caption_idx, 0.0)
             relevance[image_idx][caption_idx] = max(previous_score, score)
 
@@ -137,9 +137,9 @@ def load_cxc_image_caption_records(
         print(f"Debug: examples skipped because no cxc_scores = {no_cxc_count}")
         print(f"Debug: examples skipped because image file missing = {missing_count}")
 
-        for example in images[:5]:
-            filename = example.get("filename")
-            filepath = example.get("filepath")
+        for image_record in images[:5]:
+            filename = image_record.get("filename")
+            filepath = image_record.get("filepath")
             print(
                 "Debug example:",
                 {

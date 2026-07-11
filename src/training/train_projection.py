@@ -191,6 +191,17 @@ def parse_args():
 
     parser.add_argument("--train-split", type=str, default="train")
     parser.add_argument("--val-split", type=str, default=None)
+    parser.add_argument(
+        "--image_metadata",
+        "--image-metadata",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Image metadata JSONL path(s) to train on. If omitted, all default "
+            "image metadata paths are used."
+        ),
+    )
 
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=1000)
@@ -232,8 +243,21 @@ def main():
 
     print(f"[INFO] Device: {device}")
 
+    image_metadata_paths = (
+        [Path(path) for path in args.image_metadata]
+        if args.image_metadata is not None
+        else DEFAULT_IMAGE_METADATA_PATHS
+    )
+    if not image_metadata_paths:
+        raise ValueError(
+            "No image metadata paths provided. Omit --image_metadata to use defaults."
+        )
+    print("[INFO] Image metadata:")
+    for path in image_metadata_paths:
+        print(f"  - {path}")
+
     train_records, val_records = load_projection_records(
-        metadata_paths=DEFAULT_IMAGE_METADATA_PATHS,
+        metadata_paths=image_metadata_paths,
         project_root=PROJECT_ROOT,
         train_split=args.train_split,
         val_split=args.val_split,

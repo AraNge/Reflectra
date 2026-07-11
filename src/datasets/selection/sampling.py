@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from src.utils.hashing import stable_hash_id
 
 
 def filter_by_dataset(
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     dataset_name: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     return [
         record
         for record in records
@@ -14,9 +18,9 @@ def filter_by_dataset(
 
 
 def filter_by_split(
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     split: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     return [
         record
         for record in records
@@ -24,11 +28,35 @@ def filter_by_split(
     ]
 
 
+def deterministic_sample(
+    records: list[dict[str, Any]],
+    count: int,
+    seed: int,
+    id_field: str,
+) -> list[dict[str, Any]]:
+    """
+    Select the same records on every machine without depending on input order.
+    """
+    ranked = sorted(
+        records,
+        key=lambda record: (
+            stable_hash_id(
+                "sample",
+                seed,
+                record[id_field],
+                length=64,
+            ),
+            record[id_field],
+        ),
+    )
+    return ranked[: min(count, len(ranked))]
+
+
 def sample_fraction(
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     fraction: float,
     seed: int = 42,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if fraction <= 0:
         return []
 
@@ -42,10 +70,10 @@ def sample_fraction(
 
 
 def sample_n(
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     n: int,
     seed: int = 42,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if n <= 0:
         return []
 
@@ -57,19 +85,10 @@ def sample_n(
 
 
 def sample_by_dataset_fractions(
-    records: List[Dict[str, Any]],
-    fractions: Dict[str, float],
+    records: list[dict[str, Any]],
+    fractions: dict[str, float],
     seed: int = 42,
-) -> List[Dict[str, Any]]:
-    """
-    Example:
-        fractions = {
-            "coco_karpathy": 0.5,
-            "nlphuji/flickr30k": 0.8,
-            "LiangJian24/EmoSet": 1.0,
-        }
-    """
-
+) -> list[dict[str, Any]]:
     sampled = []
 
     for dataset_name, fraction in fractions.items():
@@ -87,18 +106,10 @@ def sample_by_dataset_fractions(
 
 
 def sample_by_dataset_counts(
-    records: List[Dict[str, Any]],
-    counts: Dict[str, int],
+    records: list[dict[str, Any]],
+    counts: dict[str, int],
     seed: int = 42,
-) -> List[Dict[str, Any]]:
-    """
-    Example:
-        counts = {
-            "coco_karpathy": 50000,
-            "nlphuji/flickr30k": 10000,
-        }
-    """
-
+) -> list[dict[str, Any]]:
     sampled = []
 
     for dataset_name, count in counts.items():
@@ -116,10 +127,10 @@ def sample_by_dataset_counts(
 
 
 def limit_total(
-    records: List[Dict[str, Any]],
-    max_samples: Optional[int],
+    records: list[dict[str, Any]],
+    max_samples: int | None,
     seed: int = 42,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if max_samples is None:
         return records
 

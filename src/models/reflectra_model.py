@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from src.models.clip_encoder import PretrainedCLIPEncoder
 from src.models.clap_encoder import PretrainedCLAPEncoder
-from src.models.projection_head import MLPProjection, LinearProjection, QFormerHead
+from src.models.projection_head import MLPProjection, LinearProjection
 
 
 ProjectionType = Literal["mlp", "linear"]
@@ -45,10 +45,6 @@ class ReflectraModel(nn.Module):
 
         self.normalize = normalize
 
-        self.clip_dim = self._get_clip_embedding_dim()
-        self.clap_dim = self._get_clap_embedding_dim()
-
-
         self.clip = PretrainedCLIPEncoder(
             model_name=clip_model_name,
             freeze=freeze_clip,
@@ -60,6 +56,9 @@ class ReflectraModel(nn.Module):
             freeze=freeze_clap,
             device=device,
         )
+
+        self.clip_dim = self._get_clip_embedding_dim()
+        self.clap_dim = self._get_clap_embedding_dim()
 
         if projection_type == "mlp":
             self.image_projection = MLPProjection(
@@ -75,6 +74,8 @@ class ReflectraModel(nn.Module):
                 output_dim=self.clap_dim,
                 normalize=normalize,
             )
+        else:
+            raise ValueError(f"Unsupported projection_type: {projection_type}")
 
         self.to(self.device)
 

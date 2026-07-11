@@ -170,7 +170,7 @@ All normal metadata JSONL rows use a small generic schema:
 }
 ```
 
-For image datasets, `audio_id/audio_path` are replaced by `image_id/image_path`. Loaders always expand `captions` into one training/evaluation record per caption.
+For image datasets, `audio_id/audio_path` are replaced by `image_id/image_path`. Metadata loaders keep captions grouped on each media item; torch datasets combine the `captions` list into one training text when reading a sample.
 
 ---
 
@@ -199,11 +199,11 @@ reflectra/
 │   │   ├── downloaders/
 │   │   ├── evaluation_inputs/
 │   │   ├── loaders/
-│   │   └── preprocessing/
+│   │   ├── preprocessing/
+│   │   └── selection/
 │   ├── evaluation/
 │   │   ├── evaluate_clap.py
-│   │   ├── evaluate_clip.py
-│   │   └── evaluate_clip_cxc.py
+│   │   └── evaluate_clip.py
 │   ├── metrics/
 │   │   └── retrieval_metrics.py
 │   ├── models/
@@ -347,7 +347,7 @@ python -m src.datasets.downloaders.download_musiccaps --number 100
 python -m src.datasets.downloaders.download_audioset --number 100
 python -m src.datasets.downloaders.download_mtg_jamendo --split train --number 100
 python -m src.datasets.downloaders.download_mtg_jamendo --split validation --number 100
-python -m src.datasets.downloaders.download_coco --splits val2014
+python -m src.datasets.downloaders.download_coco
 python -m src.datasets.downloaders.download_flickr30k --number 100
 python -m src.datasets.downloaders.download_emoset --split train --number 100
 python -m src.datasets.downloaders.download_emoset --split test --number 100
@@ -355,153 +355,210 @@ python -m src.datasets.downloaders.download_emoset --split test --number 100
 
 Start small first. Verify metadata and file paths before downloading large datasets.
 
-COCO has large official zip files. The downloader shows byte progress while downloading and file progress while extracting:
+COCO has a large official val2014 zip file. The downloader shows byte progress while downloading and file progress while extracting:
 
 ```bash
-python -m src.datasets.downloaders.download_coco --splits train2014 val2014
-python -m src.datasets.downloaders.download_coco --splits test2014 --skip-metadata
+python -m src.datasets.downloaders.download_coco
+python -m src.datasets.downloaders.download_coco --skip-metadata
 ```
 
-For the CxC SITS CLIP benchmark, prepare the merged Karpathy+CxC metadata:
+For the CxC SITS CLIP benchmark, prepare the merged Karpathy+CxC val metadata:
 
 ```bash
-python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc --cxc-split all
+python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc
 ```
 
 This writes files such as:
 
 ```text
 data/metadata/coco_karpathy_cxc_sits_val.json
-data/metadata/coco_karpathy_cxc_sits_test.json
 ```
+
+---
+
+## Create Metadata From Local Media
+
+You can create Reflectra metadata JSONL from your own audio and image folders with an OpenAI-compatible multimodal model:
+
+```bash
+python -m src.datasets.create_metadata \
+  --audio_path data/music \
+  --image_path data/my_images \
+  --source_dataset my_local_media
+```
+
+This writes:
+
+```text
+data/metadata/custom_audio_metadata.jsonl
+data/metadata/custom_image_metadata.jsonl
+```
+
+Use custom output names when needed:
+
+```bash
+python -m src.datasets.create_metadata \
+  --audio-path /path/to/music \
+  --audio-output my_music_metadata.jsonl
+```
+
+The script uses `[benchmark].model` from `configs/reflectra.toml` by default, unless `[metadata].model` or `--model` is set. Images and audio are sent to the LLM, so the selected model/server must support the corresponding media input type.
+
+For long audio files, only a middle excerpt is sent to the LLM by default:
+
+```bash
+python -m src.datasets.create_metadata \
+  --audio_path data/music \
+  --audio_clip_seconds 15
+```
+
+Use `--audio_clip_seconds 0` to send full audio files.
+
+To benchmark only this generated metadata, pass the files explicitly:
+
+```bash
+python -m src.benchmark.create_benchmark \
+  --image_metadata data/metadata/custom_image_metadata.jsonl \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl
+```
+
+---
+
+## Create Image-Audio Benchmark
+
+The benchmark builder samples image metadata and audio metadata deterministically, asks an OpenAI model to score every assigned image/audio pair from 0 to 10, and writes resumable shard files.
+
+Set your client settings in `configs/reflectra.toml` or pass them on the CLI:
+
+```toml
+[llm]
+base_url = ""
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+```
+
+For OpenAI-hosted models, setting the environment variable is usually enough:
+
+```bash
+export OPENAI_API_KEY="..."
+```
+
+For a local OpenAI-compatible server, set `base_url` in config or pass `--base_url`.
+
+Run a small single-shard benchmark:
+
+```bash
+python -m src.benchmark.create_benchmark \
+  --mode build \
+  --image_samples 20 \
+  --audio_samples 20 \
+  --batch_size 10
+```
+
+For multiple workers or machines, give every run the same metadata paths, sample counts, seed, model, and shard count, changing only `--shard_index`:
+
+```bash
+python -m src.benchmark.create_benchmark \
+  --mode build \
+  --image_samples 100 \
+  --audio_samples 100 \
+  --num_shards 4 \
+  --shard_index 0
+```
+
+After all shards finish, merge them into compact Parquet tables:
+
+```bash
+python -m src.benchmark.create_benchmark \
+  --mode merge \
+  --image_samples 100 \
+  --audio_samples 100 \
+  --num_shards 4
+```
+
+By default, metadata is read from `data/metadata` and benchmark outputs are written to `data/benchmark`. The default benchmark model, random seed, output directory, and Hugging Face export setting live in `configs/reflectra.toml` under `[benchmark]`. CLI arguments override the config.
+
+Merge writes the normalized byte tables:
+
+```text
+data/benchmark/audio_table.parquet
+data/benchmark/image_table.parquet
+data/benchmark/image_audio_scores.parquet
+```
+
+It also writes `data/benchmark/benchmark_hf.parquet` by default. That table duplicates each scored pair into one row and stores `image` and `audio` with Hugging Face `Image` and `Audio` features, backed by embedded bytes so they can be previewed or played after upload. Use `--no-write_hf` to skip that larger viewer-friendly file.
+
+---
+
+## Create CLAP LLM Benchmark
+
+To check whether CLAP is suitable for music captions before fine-tuning, create a caption-to-audio benchmark with LLM-graded positives and random negatives:
+
+```bash
+python -m src.benchmark.create_clap_benchmark \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
+  --audio_samples 100 \
+  --queries_per_audio 1 \
+  --num_negatives 9
+```
+
+Each query uses a known caption/audio pair as the positive and random audio files as negatives. The LLM scores every candidate audio from 0 to 10 and writes:
+
+```text
+data/benchmark/clap_llm_benchmark.jsonl
+data/benchmark/clap_llm_benchmark.csv
+data/benchmark/clap_llm_benchmark.parquet
+data/benchmark/clap_llm_benchmark_manifest.json
+```
+
+The audio sent to the LLM is clipped to a middle 15-second excerpt by default. Use `--audio_clip_seconds 0` for full files.
 
 ---
 
 ## Evaluation
 
-There are two evaluation styles:
+There are three evaluation styles:
 
-1. Dense local evaluation for small and medium benchmark subsets.
-2. Qdrant vector search for indexing and retrieving from a local music library.
+1. CLAP evaluation against the LLM-scored caption-to-audio benchmark.
+2. CLIP evaluation against CxC graded image-caption relevance.
+3. Reflectra image-to-audio evaluation against the created benchmark.
 
-Dense evaluation computes a similarity matrix between the sampled media items and captions. Relevance is stored sparsely, so the scripts do not create a dense zero-filled relevance matrix.
+Evaluation computes model similarities and compares them with sparse relevance labels, so scripts do not create dense zero-filled relevance matrices.
 
 ---
 
 ### 1. Evaluate CLAP: Text-to-Audio
 
-This evaluates whether CLAP can retrieve the correct audio from a text description.
-
-```bash
-python -m src.evaluation.evaluate_clap --max-samples 1000
-```
-
-Use selected dataset fractions:
+This evaluates CLAP against the LLM-scored CLAP benchmark created by `src.benchmark.create_clap_benchmark`.
 
 ```bash
 python -m src.evaluation.evaluate_clap \
-  --dataset-fractions "google/MusicCaps=1.0,agkphysics/AudioSet=0.5,rkstgr/mtg-jamendo=0.8" \
-  --max-samples 50000
+  --benchmark data/benchmark/clap_llm_benchmark.jsonl \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl
 ```
 
-Use exact dataset counts:
+The script computes CLAP text-to-audio rankings for each benchmark caption over that query's positive and random-negative candidate audios.
 
-```bash
-python -m src.evaluation.evaluate_clap \
-  --dataset-counts "google/MusicCaps=5000,rkstgr/mtg-jamendo=10000,agkphysics/AudioSet=20000"
-```
-
-The script computes:
+Metrics:
 
 ```text
-audio → text
-text → audio
-```
-
-Typical metrics:
-
-```text
-Binary retrieval:
-- hit@1, hit@5, hit@10
-- recall@1, recall@5, recall@10
-- mrr
-- median_rank
-- mean_rank
-
-Binary NDCG:
 - ndcg@1, ndcg@5, ndcg@10
-
-Balanced pairwise:
-- hit@1, hit@5, hit@10
 - mrr
-- median_rank
-- mean_rank
+- mAP
+- recall@1, recall@5, recall@10
+- precision@1, precision@5, precision@10
 ```
 
-Each audio file may have multiple captions. All captions attached to the same audio item are treated as relevant positives.
+NDCG uses the LLM 0..10 score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant.
 
 ---
 
-### 2. Evaluate CLIP: Image-to-Text
+### 2. Evaluate CLIP: Image-to-Caption CxC
 
-This evaluates whether CLIP retrieves matching captions for images.
-
-```bash
-python -m src.evaluation.evaluate_clip --max-samples 1000
-```
-
-Use selected dataset fractions:
+This evaluates CLIP with CxC SITS graded image-caption relevance labels. It is the old CxC evaluator, now exposed as `evaluate_clip.py`.
 
 ```bash
 python -m src.evaluation.evaluate_clip \
-  --dataset-fractions "coco_karpathy=0.5,nlphuji/flickr30k=0.8,LiangJian24/EmoSet=1.0" \
-  --max-samples 50000
-```
-
-Use exact dataset counts:
-
-```bash
-python -m src.evaluation.evaluate_clip \
-  --dataset-counts "coco_karpathy=5000,nlphuji/flickr30k=1000,LiangJian24/EmoSet=1000"
-```
-
-The script computes:
-
-```text
-image → text
-text → image
-```
-
-Metrics are the same grouped binary metrics used by CLAP:
-
-```text
-Binary retrieval:
-- hit@1, hit@5, hit@10
-- recall@1, recall@5, recall@10
-- mrr
-- median_rank
-- mean_rank
-
-Binary NDCG:
-- ndcg@1, ndcg@5, ndcg@10
-
-Balanced pairwise:
-- hit@1, hit@5, hit@10
-- mrr
-- median_rank
-- mean_rank
-```
-
-Each image may have multiple captions. All captions attached to the same image are treated as relevant positives.
-
----
-
-### 3. Evaluate CLIP on CxC
-
-CxC is different from the normal CLIP script because it has graded relevance labels. This evaluation stores CxC SITS scores sparsely instead of building a dense zero-filled relevance matrix.
-
-```bash
-python -m src.evaluation.evaluate_clip_cxc \
   --metadata data/metadata/coco_karpathy_cxc_sits_val.json \
   --image-root data/coco_images \
   --max-images 1000
@@ -517,25 +574,42 @@ caption → image
 Metrics:
 
 ```text
-Graded:
 - ndcg@1, ndcg@5, ndcg@10
-- ndcg@1/5/10 with exponential gain
-
-Binary view of CxC labels:
-- hit@1, hit@5, hit@10
+- mrr
+- mAP
 - recall@1, recall@5, recall@10
-- mrr
-- median_rank
-- mean_rank
-
-Balanced pairwise:
-- hit@1, hit@5, hit@10
-- mrr
-- median_rank
-- mean_rank
+- precision@1, precision@5, precision@10
 ```
 
-For binary metrics, every CxC score `> 0` is treated as relevant.
+For MRR, mAP, recall, and precision, every CxC score `> 0` is treated as relevant. NDCG uses the raw graded CxC score.
+
+---
+
+### 3. Evaluate Reflectra: Image-to-Audio
+
+This evaluates the full image-to-audio system on the benchmark created by `src.benchmark.create_benchmark`.
+
+```bash
+python -m src.evaluation.evaluate_reflectra \
+  --benchmark data/benchmark/image_audio_scores.parquet \
+  --image_metadata data/metadata/custom_image_metadata.jsonl \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
+  --checkpoint checkpoints/reflectra.pt
+```
+
+The evaluator loads image/audio paths from metadata, computes Reflectra image-to-audio similarities, and compares them with the LLM benchmark scores.
+
+Metrics:
+
+```text
+- ndcg@1, ndcg@5, ndcg@10
+- mrr
+- mAP
+- recall@1, recall@5, recall@10
+- precision@1, precision@5, precision@10
+```
+
+NDCG uses the benchmark LLM score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant.
 
 ---
 
@@ -574,56 +648,52 @@ Defaults such as CLAP model name, Qdrant URL, collection name, vector size, batc
 
 ## Metrics
 
-Normal CLIP and CLAP evaluation uses grouped sparse relevance:
+CLAP evaluation uses the LLM-scored caption-to-audio benchmark. CLIP evaluation uses CxC graded sparse relevance. Reflectra evaluation uses the created image/audio benchmark:
 
 ```text
 python -m src.evaluation.evaluate_clap
 python -m src.evaluation.evaluate_clip
+python -m src.evaluation.evaluate_reflectra
 ```
 
-In this setup, each media item can have one or more captions. The scripts build unique media targets, unique text targets, and sparse positive links:
+The scripts report:
 
 ```text
-hit@K = 1 if at least one relevant target appears in top K, else 0
-recall@K = relevant retrieved items in top K / total relevant items
-mrr = reciprocal rank of the first relevant target
-median_rank = median first-relevant rank
-mean_rank = mean first-relevant rank
 ndcg@K = ranking quality with relevant items rewarded near the top
+mrr = reciprocal rank of the first relevant target
+mAP = mean average precision across queries
+recall@K = relevant retrieved items in top K / total relevant items
+precision@K = relevant retrieved items in top K / K
 ```
 
-CxC evaluation uses graded sparse relevance:
-
-```text
-python -m src.evaluation.evaluate_clip_cxc
-```
-
-CxC SITS has graded scores. For NDCG it uses the raw CxC score as relevance. For binary retrieval metrics, every CxC score `> 0` is treated as relevant.
-
-Balanced pairwise metrics are also reported. Each positive edge is evaluated against one positive plus up to the requested number of sampled negatives. If the target set is smaller than the requested candidate count, the script reports the actual candidate count used.
+CLAP NDCG uses LLM 0..10 scores as graded relevance. CLIP NDCG uses raw CxC scores as graded relevance. Reflectra NDCG uses the image/audio benchmark LLM scores as graded relevance.
 
 Recommended reporting:
 
 ```text
-CLAP grouped text-to-audio / audio-to-text:
-- hit@1, hit@5, hit@10
+CLAP LLM benchmark text-to-audio:
+- ndcg@1
+- ndcg@5
+- ndcg@10
+- mrr
+- mAP
 - recall@1, recall@5, recall@10
-- ndcg@1, ndcg@5, ndcg@10
-- mrr, median_rank, mean_rank
-
-CLIP grouped image-to-text / text-to-image:
-- hit@1, hit@5, hit@10
-- recall@1, recall@5, recall@10
-- ndcg@1, ndcg@5, ndcg@10
-- mrr, median_rank, mean_rank
+- precision@1, precision@5, precision@10
 
 CLIP CxC:
 - ndcg@1
 - ndcg@5
 - ndcg@10
-- hit@1, hit@5, hit@10
-- recall@1, recall@5, recall@10
 - mrr
+- mAP
+- recall@1, recall@5, recall@10
+- precision@1, precision@5, precision@10
+
+Reflectra image-to-audio:
+- ndcg@1, ndcg@5, ndcg@10
+- mrr, mAP
+- recall@1, recall@5, recall@10
+- precision@1, precision@5, precision@10
 
 Image-to-music final system, later:
 - Precision@10 by mood/genre metadata
@@ -639,25 +709,46 @@ Image-to-music final system, later:
 ### Experiment 1: CLAP zero-shot baseline
 
 ```bash
-python -m src.evaluation.evaluate_clap --max-samples 1000
+python -m src.evaluation.evaluate_clap \
+  --benchmark data/benchmark/clap_llm_benchmark.jsonl \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl
 ```
 
 Purpose:
 
 ```text
-Measure pretrained CLAP before fine-tuning.
+Measure pretrained CLAP against LLM-scored music-caption relevance before fine-tuning.
 ```
 
-### Experiment 2: CLIP image-text baseline
+### Experiment 2: CLIP CxC baseline
 
 ```bash
-python -m src.evaluation.evaluate_clip --max-samples 1000
+python -m src.evaluation.evaluate_clip \
+  --metadata data/metadata/coco_karpathy_cxc_sits_val.json \
+  --image-root data/coco_images \
+  --max-images 1000
 ```
 
 Purpose:
 
 ```text
-Measure whether CLIP aligns images with captions and music-oriented mood captions.
+Measure whether CLIP aligns images with captions using CxC graded relevance labels.
+```
+
+### Experiment 3: Reflectra image-to-audio benchmark
+
+```bash
+python -m src.evaluation.evaluate_reflectra \
+  --benchmark data/benchmark/image_audio_scores.parquet \
+  --image_metadata data/metadata/custom_image_metadata.jsonl \
+  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
+  --checkpoint checkpoints/reflectra.pt
+```
+
+Purpose:
+
+```text
+Measure the trained image-to-CLAP projection against LLM-scored image/audio relevance.
 ```
 
 ---
@@ -670,13 +761,15 @@ Recommended order:
 1. Install the project with pyproject.toml.
 2. Start Qdrant.
 3. Download a small sample from each dataset.
-4. Run CLAP dense evaluation.
-5. Run CLIP dense evaluation.
-6. Put local songs in `data/music`.
-7. Index local music CLAP audio embeddings in Qdrant.
-8. Scale to a larger music library.
-9. Train image-to-CLAP projection only after baselines work.
-10. Build final image-to-song demo.
+4. Create local metadata or download dataset metadata.
+5. Create the CLAP LLM benchmark and evaluate CLAP.
+6. Prepare CxC and evaluate CLIP.
+7. Create the image/audio benchmark.
+8. Train image-to-CLAP projection only after baselines work.
+9. Evaluate Reflectra on the image/audio benchmark.
+10. Put local songs in `data/music` and index CLAP audio embeddings in Qdrant.
+11. Scale to a larger music library.
+12. Build final image-to-song demo.
 ```
 
 ---
@@ -698,19 +791,13 @@ Audio-text datasets:
 
 - MusicCaps: https://huggingface.co/datasets/google/MusicCaps
 - Song Describer Dataset: https://huggingface.co/datasets/renumics/song-describer-dataset
-- MTG-Jamendo Hugging Face mirror: https://huggingface.co/datasets/rkstgr/mtg-jamendo
-- MTG-Jamendo original project: https://github.com/MTG/mtg-jamendo-dataset
-- AudioSet Hugging Face mirror: https://huggingface.co/datasets/agkphysics/AudioSet
-- AudioSet original project: https://research.google.com/audioset/
+- MTG-Jamendo Hugging Face: https://huggingface.co/datasets/rkstgr/mtg-jamendo
+- AudioSet Hugging Face: https://huggingface.co/datasets/agkphysics/AudioSet
 
 Image-text / image-mood datasets:
 
-- Flickr30k Hugging Face mirror: https://huggingface.co/datasets/nlphuji/flickr30k
+- Flickr30k Hugging Face: https://huggingface.co/datasets/nlphuji/flickr30k
 - EmoSet: https://huggingface.co/datasets/LiangJian24/EmoSet
-- COCO dataset downloads: https://cocodataset.org/#download
-
 - CxC SITS labels: https://github.com/google-research-datasets/Crisscrossed-Captions
-- COCO 2014 train images: http://images.cocodataset.org/zips/train2014.zip
 - COCO 2014 validation images: http://images.cocodataset.org/zips/val2014.zip
-- COCO 2014 test images: http://images.cocodataset.org/zips/test2014.zip
 - Karpathy COCO caption metadata: http://cs.stanford.edu/people/karpathy/deepimagesent/coco.zip

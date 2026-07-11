@@ -3,21 +3,18 @@ from typing import Any, Dict, List, Optional
 
 from torch.utils.data import Dataset, DataLoader
 
-from src.datasets.loaders.image_metadata import ImageTextMetadataLoader
-from src.datasets.preprocessing.sampling import (
-    sample_by_dataset_fractions,
-    sample_by_dataset_counts,
+from src.datasets.paths import PROJECT_ROOT
+from src.datasets.selection import (
+    DEFAULT_IMAGE_METADATA_PATHS,
     limit_total,
+    load_image_metadata,
+    sample_by_dataset_counts,
+    sample_by_dataset_fractions,
 )
-from src.datasets.paths import METADATA_DIR, PROJECT_ROOT
 
 
-DEFAULT_IMAGE_METADATA_PATHS = [
-    METADATA_DIR / "coco_captions_metadata.jsonl",
-    METADATA_DIR / "flickr30k_metadata.jsonl",
-    METADATA_DIR / "emoset_train_metadata.jsonl",
-    METADATA_DIR / "emoset_test_metadata.jsonl",
-]
+def combine_captions(captions: List[str]) -> str:
+    return " ".join(caption.strip() for caption in captions if caption.strip())
 
 
 class ImageTextProjectionDataset(Dataset):
@@ -30,7 +27,6 @@ class ImageTextProjectionDataset(Dataset):
     - image_id
     - source_dataset
     - split
-    - text_type
     """
 
     def __init__(self, records: List[Dict[str, Any]]):
@@ -43,11 +39,10 @@ class ImageTextProjectionDataset(Dataset):
         record = self.records[idx]
         return {
             "image_path": record["image_path"],
-            "text": record["text"],
+            "text": combine_captions(record["captions"]),
             "image_id": record["image_id"],
             "source_dataset": record["source_dataset"],
             "split": record["split"],
-            "text_type": record["text_type"],
         }
 
 
@@ -58,7 +53,6 @@ def collate_projection_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "image_ids": [item["image_id"] for item in batch],
         "source_datasets": [item["source_dataset"] for item in batch],
         "splits": [item["split"] for item in batch],
-        "text_types": [item["text_type"] for item in batch],
     }
 
 
@@ -115,13 +109,11 @@ def load_projection_records(
     if metadata_paths is None:
         metadata_paths = DEFAULT_IMAGE_METADATA_PATHS
 
-    loader = ImageTextMetadataLoader(
+    records = load_image_metadata(
         metadata_paths=metadata_paths,
         project_root=project_root,
         require_image_exists=require_image_exists,
     )
-
-    records = loader.load()
 
     parsed_fractions = parse_dataset_fractions(dataset_fractions)
     parsed_counts = parse_dataset_counts(dataset_counts)
@@ -138,23 +130,23 @@ def load_projection_records(
             counts=parsed_counts,
         )
 
-    train_records = [
+    train_image_records = [
         record for record in records
         if record["split"] == train_split
     ]
 
     if val_split is not None:
-        val_records = [
+        val_image_records = [
             record for record in records
             if record["split"] == val_split
         ]
     else:
-        val_records = []
+        val_image_records = []
 
-    train_records = limit_total(train_records, max_train_samples)
-    val_records = limit_total(val_records, max_val_samples)
+    train_image_records = limit_total(train_image_records, max_train_samples)
+    val_image_records = limit_total(val_image_records, max_val_samples)
 
-    return train_records, val_records
+    return train_image_records, val_image_records
 
 
 def create_projection_dataloaders(

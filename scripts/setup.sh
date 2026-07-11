@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 echo "[INFO] Project root: $PROJECT_ROOT"
@@ -20,6 +20,7 @@ mkdir -p \
   data/embeddings/audio \
   data/embeddings/image \
   data/embeddings/text \
+  data/benchmark \
   data/hf_cache \
   results \
   qdrant_storage
@@ -39,6 +40,17 @@ vector_size = 512
 music_dir = "data/music"
 batch_size = 8
 extensions = [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]
+
+[llm]
+base_url = ""
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+
+[benchmark]
+model = "gpt-4.1-mini"
+random_seed = 42
+output_dir = "data/benchmark"
+write_hf = true
 EOF
   echo "[INFO] Created configs/reflectra.toml"
 fi

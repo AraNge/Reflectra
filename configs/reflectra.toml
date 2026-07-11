@@ -11,3 +11,16 @@ vector_size = 512
 music_dir = "data/music"
 batch_size = 8
 extensions = [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]
+
+[llm]
+base_url = "http://127.0.0.1:8080"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+max_output_tokens = 128
+
+[benchmark]
+model = "gemma-4-E4B-it"
+batch_size = 4
+random_seed = 11062026
+output_dir = "data/benchmark"
+write_hf = true
