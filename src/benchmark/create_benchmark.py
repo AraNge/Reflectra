@@ -102,14 +102,46 @@ def shard_for_pair(pair_id: str, num_shards: int) -> int:
     return int(digest, 16) % num_shards
 
 
+def audio_for_image(
+    image: dict[str, Any],
+    audio: list[dict[str, Any]],
+    max_samples: int | None,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if max_samples is None or max_samples >= len(audio):
+        return audio
+
+    ranked = sorted(
+        audio,
+        key=lambda record: (
+            stable_hash_id(
+                "benchmark_audio_per_image",
+                seed,
+                image["image_id"],
+                record["audio_id"],
+                length=64,
+            ),
+            record["audio_id"],
+        ),
+    )
+    return ranked[:max_samples]
+
+
 def iter_shard_pairs(
     images: list[dict[str, Any]],
     audio: list[dict[str, Any]],
     num_shards: int,
     shard_index: int,
+    max_samples: int | None,
+    seed: int,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any], str]]:
     for image in images:
-        for audio_record in audio:
+        for audio_record in audio_for_image(
+            image=image,
+            audio=audio,
+            max_samples=max_samples,
+            seed=seed,
+        ):
             pair_id = make_pair_id(
                 image_id=image["image_id"],
                 audio_id=audio_record["audio_id"],
@@ -124,6 +156,8 @@ def count_shard_pairs(
     audio: list[dict[str, Any]],
     num_shards: int,
     shard_index: int,
+    max_samples: int | None,
+    seed: int,
 ) -> int:
     return sum(
         1
@@ -132,6 +166,8 @@ def count_shard_pairs(
             audio=audio,
             num_shards=num_shards,
             shard_index=shard_index,
+            max_samples=max_samples,
+            seed=seed,
         )
     )
 
@@ -365,6 +401,7 @@ def write_or_validate_manifest(
             "shard_index",
             "image_count",
             "audio_count",
+            "max_samples",
             "random_seed",
             "model",
         ]
@@ -445,6 +482,19 @@ def build_shard(args: argparse.Namespace) -> None:
         audio=audio,
         num_shards=args.num_shards,
         shard_index=args.shard_index,
+        max_samples=args.max_samples,
+        seed=args.random_seed,
+    )
+    total_pair_count = sum(
+        len(
+            audio_for_image(
+                image=image,
+                audio=audio,
+                max_samples=args.max_samples,
+                seed=args.random_seed,
+            )
+        )
+        for image in images
     )
 
     write_or_validate_manifest(
@@ -455,7 +505,8 @@ def build_shard(args: argparse.Namespace) -> None:
             "shard_index": args.shard_index,
             "image_count": len(images),
             "audio_count": len(audio),
-            "total_pair_count": len(images) * len(audio),
+            "max_samples": args.max_samples,
+            "total_pair_count": total_pair_count,
             "assigned_pair_count": assigned_pair_count,
             "random_seed": args.random_seed,
             "image_samples": args.image_samples,
@@ -519,7 +570,12 @@ def build_shard(args: argparse.Namespace) -> None:
                     tuple[dict[str, Any], str]
                 ] = []
 
-                for audio_record in audio:
+                for audio_record in audio_for_image(
+                    image=image,
+                    audio=audio,
+                    max_samples=args.max_samples,
+                    seed=args.random_seed,
+                ):
                     pair_id = make_pair_id(
                         image_id=image["image_id"],
                         audio_id=audio_record["audio_id"],
@@ -649,6 +705,7 @@ def load_manifests(
         "num_shards",
         "image_count",
         "audio_count",
+        "max_samples",
         "total_pair_count",
         "random_seed",
         "model",
@@ -810,6 +867,7 @@ def merge_shards(args: argparse.Namespace) -> None:
                 "dataset_fingerprint"
             ],
             "num_shards": args.num_shards,
+            "max_samples": manifests[0].get("max_samples"),
             "expected_pair_count": expected_count,
             "actual_pair_count": actual_count,
             "complete": actual_count == expected_count,
@@ -874,6 +932,17 @@ def parse_args() -> argparse.Namespace:
         "--audio_samples",
         type=int,
         default=100,
+    )
+    parser.add_argument(
+        "--max-samples",
+        "--max_samples",
+        dest="max_samples",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of audio candidates to score per image. "
+            "If omitted, every sampled audio item is scored for every image."
+        ),
     )
     parser.add_argument(
         "--batch_size",
@@ -979,6 +1048,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.audio_samples < 1:
         parser.error("--audio_samples must be at least 1.")
+
+    if args.max_samples is not None and args.max_samples < 1:
+        parser.error("--max-samples must be at least 1 when provided.")
 
     if args.batch_size < 1:
         parser.error("--batch_size must be at least 1.")

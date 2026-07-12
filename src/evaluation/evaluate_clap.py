@@ -20,7 +20,7 @@ from src.utils.media_tables import load_audio_table
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCHMARK_DIR = PROJECT_ROOT / "data" / "benchmark"
+DEFAULT_BENCHMARK_DIR = PROJECT_ROOT / "data" / "clap_benchmark"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "evaluation_results" / "clap_eval_results.json"
 
 

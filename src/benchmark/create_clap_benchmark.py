@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import random
 import tempfile
 import time
 from pathlib import Path
@@ -14,7 +13,7 @@ from openai import OpenAI
 from tqdm import tqdm
 
 from src.config import get_nested, load_config
-from src.datasets.selection import deterministic_sample
+from src.datasets.selection import deterministic_sample, load_audio_metadata
 from src.metrics.retrieval_metrics import sparse_retrieval_metrics
 from src.utils.audio import audio_payload_for_llm
 from src.utils.hashing import stable_hash_id
@@ -25,6 +24,10 @@ from src.utils.openai_client import create_openai_client
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_TABLE_PATH = PROJECT_ROOT / "data" / "benchmark" / "audio_table.parquet"
+DEFAULT_AUDIO_METADATA_PATH = (
+    PROJECT_ROOT / "data" / "metadata" / "song_describer_metadata.jsonl"
+)
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "clap_benchmark"
 
 PROMPT = """
 Return only minified JSON. No markdown. No explanation.
@@ -226,8 +229,13 @@ def build_benchmark(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_parent = output_dir / "tmp"
     temp_parent.mkdir(parents=True, exist_ok=True)
-    audio_table_path = Path(args.audio_table).expanduser().resolve()
 
+    if args.audio_metadata:
+        all_audio_records = load_audio_metadata(args.audio_metadata)
+        build_benchmark_from_records(args, all_audio_records, output_dir)
+        return
+
+    audio_table_path = Path(args.audio_table).expanduser().resolve()
     with tempfile.TemporaryDirectory(
         prefix="clap_benchmark_",
         dir=temp_parent,
@@ -239,8 +247,71 @@ def build_benchmark(args: argparse.Namespace) -> None:
                 project_root=PROJECT_ROOT,
             ).values()
         )
-
         build_benchmark_from_records(args, all_audio_records, output_dir)
+
+
+def audio_for_query(
+    query_record: dict[str, Any],
+    caption: str,
+    caption_index: int,
+    records: list[dict[str, Any]],
+    max_audios: int | None,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if max_audios is None or max_audios >= len(records):
+        candidates = records
+    else:
+        negative_count = max_audios - 1
+        negatives = [
+            record
+            for record in records
+            if record["audio_id"] != query_record["audio_id"]
+        ]
+        negatives = sorted(
+            negatives,
+            key=lambda record: (
+                stable_hash_id(
+                    "clap_audio_per_query",
+                    seed,
+                    query_record["audio_id"],
+                    caption_index,
+                    caption,
+                    record["audio_id"],
+                    length=64,
+                ),
+                record["audio_id"],
+            ),
+        )[:negative_count]
+        candidates = [query_record] + negatives
+
+    return sorted(
+        candidates,
+        key=lambda record: (
+            stable_hash_id(
+                "clap_audio_candidate_order",
+                seed,
+                query_record["audio_id"],
+                caption_index,
+                caption,
+                record["audio_id"],
+                length=64,
+            ),
+            record["audio_id"],
+        ),
+    )
+
+
+def write_audio_table(records: list[dict[str, Any]], output_dir: Path) -> None:
+    rows = [
+        {
+            "audio_id": record["audio_id"],
+            "captions": record["captions"],
+            "audio": Path(record["audio_path"]).read_bytes(),
+            "audio_path": record["audio_path"],
+        }
+        for record in records
+    ]
+    pd.DataFrame(rows).to_parquet(output_dir / "audio_table.parquet", index=False)
 
 
 def build_benchmark_from_records(
@@ -257,10 +328,10 @@ def build_benchmark_from_records(
 
     if len(records) < 2:
         raise ValueError("At least two audio records are required.")
-    if len(records) < args.num_negatives + 1:
+    if args.max_audios is not None and len(records) < args.max_audios:
         raise ValueError(
-            "Not enough audio records for the requested negatives: "
-            f"need at least {args.num_negatives + 1}, found {len(records)}."
+            "Not enough audio records for --max_audios: "
+            f"need {args.max_audios}, found {len(records)}."
         )
 
     client = create_openai_client(
@@ -269,7 +340,6 @@ def build_benchmark_from_records(
         base_url=args.base_url,
         config=args.config_data,
     )
-    rng = random.Random(args.random_seed)
     output_path = output_dir / args.output_name
     completed = set() if args.force else existing_query_ids(output_path)
     rows_to_write = []
@@ -292,14 +362,14 @@ def build_benchmark_from_records(
         if query_id in completed and not args.force:
             continue
 
-        negatives = [
-            record
-            for record in records
-            if record["audio_id"] != query_record["audio_id"]
-        ]
-        rng.shuffle(negatives)
-        candidates = [query_record] + negatives[:args.num_negatives]
-        rng.shuffle(candidates)
+        candidates = audio_for_query(
+            query_record=query_record,
+            caption=caption,
+            caption_index=caption_index,
+            records=records,
+            max_audios=args.max_audios,
+            seed=args.random_seed,
+        )
 
         scores = score_audio_candidates(
             client=client,
@@ -332,18 +402,23 @@ def build_benchmark_from_records(
             output_path.with_suffix(".parquet"),
             index=False,
         )
+        write_audio_table(records, output_dir)
     except Exception as exc:
         print(f"[WARN] Parquet output was skipped: {exc}")
 
     manifest = {
         "num_queries": len(all_rows),
         "audio_samples": len(records),
-        "num_negatives": args.num_negatives,
+        "max_audios": args.max_audios,
         "queries_per_audio": args.queries_per_audio,
         "model": args.model,
         "random_seed": args.random_seed,
         "audio_clip_seconds": args.audio_clip_seconds,
-        "audio_table": str(Path(args.audio_table).expanduser().resolve()),
+        "audio_table": str((output_dir / "audio_table.parquet").resolve()),
+        "audio_metadata": [
+            str(Path(path).expanduser().resolve())
+            for path in args.audio_metadata
+        ],
         "oracle_metrics_from_llm_scores": compute_oracle_metrics(all_rows),
     }
     write_json(output_path.with_name("clap_llm_benchmark_manifest.json"), manifest)
@@ -362,10 +437,30 @@ def parse_args() -> argparse.Namespace:
         parents=[config_parser],
     )
     parser.add_argument("--audio_table", default=str(DEFAULT_AUDIO_TABLE_PATH))
+    parser.add_argument(
+        "--audio_metadata",
+        type=str,
+        nargs="*",
+        default=[str(DEFAULT_AUDIO_METADATA_PATH)],
+        help=(
+            "Audio metadata JSONL path(s). Defaults to Song Describer. "
+            "Pass no values plus --audio_table to build from a parquet table."
+        ),
+    )
     parser.add_argument("--audio_samples", type=int, default=100)
     parser.add_argument("--queries_per_audio", type=int, default=1)
     parser.add_argument("--max_queries", type=int, default=None)
-    parser.add_argument("--num_negatives", type=int, default=9)
+    parser.add_argument(
+        "--max-audios",
+        "--max_audios",
+        dest="max_audios",
+        type=int,
+        default=10,
+        help=(
+            "Maximum total audio candidates per caption query, "
+            "including the positive."
+        ),
+    )
     parser.add_argument(
         "--model",
         default=get_nested(config, "benchmark", "model", ""),
@@ -377,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output_dir",
-        default=str(benchmark_config.get("output_dir", "data/benchmark")),
+        default=str(DEFAULT_OUTPUT_DIR),
     )
     parser.add_argument("--output_name", default="clap_llm_benchmark.jsonl")
     parser.add_argument(
@@ -413,8 +508,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--audio_samples must be at least 2.")
     if args.queries_per_audio < 1:
         parser.error("--queries_per_audio must be at least 1.")
-    if args.num_negatives < 1:
-        parser.error("--num_negatives must be at least 1.")
+    if args.max_audios is not None and args.max_audios < 2:
+        parser.error("--max_audios must be at least 2.")
     if args.max_attempts < 1:
         parser.error("--max_attempts must be at least 1.")
     if args.max_output_tokens < 16:

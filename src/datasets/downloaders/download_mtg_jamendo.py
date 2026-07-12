@@ -12,6 +12,7 @@ from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
+from src.utils.audio_clipping import middle_clip_audio
 
 
 ensure_data_dirs()
@@ -94,6 +95,7 @@ def normalize_list(value: Any) -> List[str]:
 def save_audio_file(input_path: str, output_path: str) -> bool:
     try:
         waveform, sample_rate = librosa.load(input_path, sr=None, mono=False)
+        waveform = middle_clip_audio(waveform, sample_rate)
 
         if waveform.ndim == 2:
             waveform = waveform.T

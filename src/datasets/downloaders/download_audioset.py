@@ -9,6 +9,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
+from src.utils.audio_clipping import middle_clip_audio
 
 
 ensure_data_dirs()
@@ -137,6 +138,8 @@ def save_audio(audio: Dict[str, Any], output_path: str) -> bool:
 
         if array.size == 0:
             return False
+
+        array = middle_clip_audio(array, sampling_rate)
 
         # If audio is [channels, samples], convert to [samples, channels]
         if array.ndim == 2 and array.shape[0] < array.shape[1]:

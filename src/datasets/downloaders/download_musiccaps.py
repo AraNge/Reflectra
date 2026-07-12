@@ -5,6 +5,7 @@ import subprocess
 from datasets import load_dataset
 
 from src.datasets.paths import DATA_DIR, HF_CACHE_DIR, METADATA_DIR, ensure_data_dirs
+from src.utils.audio_clipping import MAX_AUDIO_SECONDS
 
 
 ensure_data_dirs()
@@ -16,8 +17,24 @@ metadata_output_path = str(METADATA_DIR / "musiccaps_metadata.jsonl")
 os.makedirs(audio_output_dir, exist_ok=True)
 
 
+def middle_interval(start_s, end_s, max_seconds=MAX_AUDIO_SECONDS):
+    start_s = float(start_s)
+    end_s = float(end_s)
+    duration = end_s - start_s
+
+    if duration <= max_seconds:
+        return start_s, end_s
+
+    midpoint = (start_s + end_s) / 2.0
+    clipped_start = midpoint - max_seconds / 2.0
+    clipped_end = clipped_start + max_seconds
+
+    return clipped_start, clipped_end
+
+
 def download_clip(ytid, start_s, end_s, output_path):
     video_url = f"https://www.youtube.com/watch?v={ytid}"
+    start_s, end_s = middle_interval(start_s, end_s)
 
     command = [
         "yt-dlp",
@@ -26,7 +43,7 @@ def download_clip(ytid, start_s, end_s, output_path):
         "-x",
         "--audio-format", "wav",
         "-f", "bestaudio",
-        "--download-sections", f"*{start_s}-{end_s}",
+        "--download-sections", f"*{start_s:.3f}-{end_s:.3f}",
         "-o", output_path,
         video_url,
     ]

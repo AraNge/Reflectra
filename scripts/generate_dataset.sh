@@ -3,6 +3,9 @@ set -euo pipefail
 
 N=1000
 NUM_SHARDS=4
+MAX_SAMPLES=6
+RESET=0
+ALLOW_INCOMPLETE_MERGE=0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLICKR_METADATA="$PROJECT_ROOT/data/metadata/flickr30k_metadata.jsonl"
 SONG_DESCRIBER_METADATA="$PROJECT_ROOT/data/metadata/song_describer_metadata.jsonl"
@@ -10,18 +13,41 @@ SONG_DESCRIBER_METADATA="$PROJECT_ROOT/data/metadata/song_describer_metadata.jso
 cd "$PROJECT_ROOT"
 
 usage() {
-  echo "Usage: $0 [-s SHARD_INDEX]" >&2
+  echo "Usage: $0 [-s SHARD_INDEX] [--max-samples NUM_AUDIO_PER_IMAGE] [--reset] [--allow-incomplete-merge]" >&2
   echo "  Omit -s for single-PC mode: build all pairs and merge parquet tables." >&2
   echo "  Use -s with shard index 0..$((NUM_SHARDS - 1)) to build one shard only." >&2
+  echo "  --max-samples controls random audio candidates per image. Default: $MAX_SAMPLES." >&2
+  echo "  Existing shard JSONL files are resumed by default; --reset deletes them first." >&2
 }
 
 SHARD_INDEX=""
-while getopts ":s:h" opt; do
-  case "$opt" in
-    s)
-      SHARD_INDEX="$OPTARG"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -s|--shard-index)
+      if [ "$#" -lt 2 ]; then
+        usage
+        exit 1
+      fi
+      SHARD_INDEX="$2"
+      shift 2
       ;;
-    h)
+    --max-samples)
+      if [ "$#" -lt 2 ]; then
+        usage
+        exit 1
+      fi
+      MAX_SAMPLES="$2"
+      shift 2
+      ;;
+    --reset)
+      RESET=1
+      shift
+      ;;
+    --allow-incomplete-merge)
+      ALLOW_INCOMPLETE_MERGE=1
+      shift
+      ;;
+    -h|--help)
       usage
       exit 0
       ;;
@@ -32,7 +58,7 @@ while getopts ":s:h" opt; do
   esac
 done
 
-if [ "$OPTIND" -le "$#" ]; then
+if ! [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || [ "$MAX_SAMPLES" -lt 1 ]; then
   usage
   exit 1
 fi
@@ -55,7 +81,7 @@ if [ -z "${HF_TOKEN:-}" ]; then
   echo "WARNING: HF_TOKEN is not set. Gated repo download may fail with 401 Unauthorized." >&2
 fi
 
-if [ "$RUN_MERGE" -eq 1 ]; then
+if [ "$RESET" -eq 1 ]; then
   rm -f data/benchmark/manifest_shard_*.json data/benchmark/benchmark_shard_*.jsonl || true
 fi
 
@@ -74,6 +100,11 @@ fi
 
 if [ "$(metadata_count "$SONG_DESCRIBER_METADATA")" -lt "$N" ]; then
   python -m src.datasets.downloaders.download_song_describer --number "$N"
+fi
+
+MERGE_EXTRA_ARGS=()
+if [ "$ALLOW_INCOMPLETE_MERGE" -eq 1 ]; then
+  MERGE_EXTRA_ARGS+=(--allow_incomplete_merge)
 fi
 
 LLAMA_CPP_DIR="$HOME/llama-cpp"
@@ -120,11 +151,12 @@ python -m src.benchmark.create_benchmark \
   --mode build \
   --image_samples "$N" \
   --audio_samples "$N" \
-  --batch_size 4 \
+  --batch_size 8 \
   --max_output_tokens 128 \
   --model "$MODEL_ALIAS" \
   --num_shards "$BENCHMARK_NUM_SHARDS" \
   --shard_index "$BENCHMARK_SHARD_INDEX" \
+  --max-samples "$MAX_SAMPLES" \
   --image_metadata "$FLICKR_METADATA" \
   --audio_metadata "$SONG_DESCRIBER_METADATA"
 
@@ -133,14 +165,16 @@ if [ "$RUN_MERGE" -eq 1 ]; then
     --mode merge \
     --image_samples "$N" \
     --audio_samples "$N" \
-    --batch_size 4 \
+    --batch_size 8 \
     --max_output_tokens 128 \
     --model "$MODEL_ALIAS" \
     --num_shards "$BENCHMARK_NUM_SHARDS" \
+    --max-samples "$MAX_SAMPLES" \
     --image_metadata "$FLICKR_METADATA" \
-    --audio_metadata "$SONG_DESCRIBER_METADATA"
+    --audio_metadata "$SONG_DESCRIBER_METADATA" \
+    "${MERGE_EXTRA_ARGS[@]}"
 else
   echo "[INFO] Built shard $BENCHMARK_SHARD_INDEX/$BENCHMARK_NUM_SHARDS."
   echo "[INFO] Merge after all shards are available with:"
-  echo "       python -m src.benchmark.create_benchmark --mode merge --image_samples $N --audio_samples $N --model $MODEL_ALIAS --num_shards $BENCHMARK_NUM_SHARDS --image_metadata $FLICKR_METADATA --audio_metadata $SONG_DESCRIBER_METADATA"
+  echo "       python -m src.benchmark.create_benchmark --mode merge --image_samples $N --audio_samples $N --max-samples $MAX_SAMPLES --model $MODEL_ALIAS --num_shards $BENCHMARK_NUM_SHARDS --image_metadata $FLICKR_METADATA --audio_metadata $SONG_DESCRIBER_METADATA"
 fi
