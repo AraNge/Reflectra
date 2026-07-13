@@ -26,7 +26,7 @@
 
 Reflectra is a multimodal retrieval system for recommending songs from an input image. The project does not generate music. Instead, it maps images, text descriptions, and audio clips into compatible embedding spaces and retrieves the closest matching audio tracks.
 
-The final goal is:
+The system flow is:
 
 ```text
 image
@@ -39,101 +39,13 @@ CLAP embedding space
 ↓
 Qdrant vector search over CLAP audio embeddings
 ↓
-ranked songs
-```
-
-The first practical MVP can be simpler:
-
-```text
-image
+candidate songs
 ↓
-image caption / mood query
-↓
-CLAP text encoder
-↓
-Qdrant search over CLAP audio embeddings
+reranker
 ↓
 ranked songs
 ```
 
----
-
-## Architecture
-
-### 1. Text-to-Audio Retrieval
-
-Text-to-audio retrieval is the first baseline. It checks whether pretrained CLAP can retrieve the correct audio clip from a natural language music description.
-
-```text
-caption: "happy energetic pop song with female vocals"
-        ↓
-CLAP text encoder
-        ↓
-text embedding
-
-song.wav
-        ↓
-CLAP audio encoder
-        ↓
-audio embedding
-
-similarity = cosine(text embedding, audio embedding)
-```
-
-This stage is used to evaluate CLAP before any image-based retrieval is added.
-
-### 2. Image-to-Text Retrieval
-
-Image-to-text retrieval evaluates the visual side using CLIP.
-
-```text
-image
-↓
-CLIP image encoder
-↓
-image embedding
-
-caption / mood caption
-↓
-CLIP text encoder
-↓
-text embedding
-
-similarity = cosine(image embedding, text embedding)
-```
-
-This stage answers whether CLIP understands image captions, scenes, and mood-related text well enough for the project.
-
-### 3. Image-to-Audio Retrieval
-
-The advanced system maps images into the CLAP audio-text space.
-
-```text
-image
-↓
-CLIP image encoder
-↓
-projection layer
-↓
-CLAP-compatible embedding
-↓
-Qdrant search over CLAP audio embeddings
-↓
-songs
-```
-
-The projection layer is trained first while CLIP and CLAP remain frozen.
-
-Recommended projection design:
-
-```text
-Linear(CLIP dimension → hidden dimension)
-GELU
-LayerNorm
-Dropout
-Linear(hidden dimension → CLAP dimension)
-L2 normalization
-```
 
 ---
 
@@ -174,87 +86,6 @@ For image datasets, `audio_id/audio_path` are replaced by `image_id/image_path`.
 
 ---
 
-## Project Structure
-
-Recommended structure:
-
-```text
-reflectra/
-├── assets/
-│   └── logo.png
-├── configs/
-│   └── reflectra.toml
-├── data/
-│   ├── music/
-│   ├── audio/
-│   ├── images/
-│   ├── metadata/
-│   ├── embeddings/
-│   └── hf_cache/
-├── results/
-├── scripts/
-│   └── setup_environment.sh
-├── src/
-│   ├── datasets/
-│   │   ├── downloaders/
-│   │   ├── evaluation_inputs/
-│   │   ├── loaders/
-│   │   ├── preprocessing/
-│   │   └── selection/
-│   ├── evaluation/
-│   │   ├── evaluate_clap.py
-│   │   └── evaluate_clip.py
-│   ├── metrics/
-│   │   └── retrieval_metrics.py
-│   ├── models/
-│   │   ├── clap_encoder.py
-│   │   ├── clip_encoder.py
-│   │   ├── projection_head.py
-│   │   └── reflectra_model.py
-│   └── vector_db/
-│       ├── qdrant_store.py
-│       └── index_clap_audio_qdrant.py
-├── pyproject.toml
-└── README.md
-```
-
-Recommended data layout:
-
-```text
-data/
-├── music/
-├── audio/
-│   ├── musiccaps/
-│   ├── audioset/
-│   ├── mtg_jamendo/
-│   └── song_describer/
-├── images/
-│   ├── coco_captions/
-│   ├── flickr30k/
-│   └── emoset/
-├── metadata/
-│   ├── musiccaps_metadata.jsonl
-│   ├── audioset_metadata.jsonl
-│   ├── song_describer_metadata.jsonl
-│   ├── mtg_jamendo_train_metadata.jsonl
-│   ├── mtg_jamendo_validation_metadata.jsonl
-│   ├── coco_captions_metadata.jsonl
-│   ├── flickr30k_metadata.jsonl
-│   ├── emoset_train_metadata.jsonl
-│   └── emoset_test_metadata.jsonl
-└── embeddings/
-```
-
-The `data/music/` folder is for your own local music library. Dataset downloaders write benchmark/training data under the other `data/` subfolders.
-
-Default model and Qdrant settings live in:
-
-```text
-configs/reflectra.toml
-```
-
----
-
 ## Installation
 
 This project uses `pyproject.toml`, so install it as a package from the project root.
@@ -275,28 +106,16 @@ python -m venv .venv
 
 ### 2. Install package
 
-Basic install:
 
 ```bash
 pip install -e .
 ```
 
-Install with development/data dependencies:
-
-```bash
-pip install -e .[dev]
-```
-
-The editable install is important because commands like this use imports from `src/`:
-
-```bash
-python -m src.evaluation.evaluate_clap
-```
 
 ### 3. Run setup script
 
 ```bash
-bash setup.sh
+bash scripts/setup.sh
 ```
 
 The setup script creates project directories, writes `configs/reflectra.toml` if missing, installs the package in editable mode, pulls the Qdrant Docker image, and starts a local Qdrant container.
@@ -338,6 +157,48 @@ docker start reflectra-qdrant
 
 ---
 
+## Scripts
+
+The `scripts/` folder contains runnable shortcuts for common workflows:
+
+```bash
+bash scripts/setup.sh
+```
+
+Creates local data/config folders, installs the project in editable mode, and starts Qdrant with Docker when available.
+
+```bash
+bash scripts/generate_clap_dataset.sh --audio-samples 100 --max-audios 6
+```
+
+Builds or resumes the CLAP caption-to-audio LLM benchmark using Song Describer metadata and a local `llama-server`.
+
+```bash
+bash scripts/generate_dataset.sh --max-samples 6
+```
+
+Builds or resumes the image-to-audio Reflectra benchmark from Flickr30k images and Song Describer audio. Use `-s INDEX` for sharded runs.
+
+```bash
+bash scripts/train_proj.sh -n 1000
+```
+
+Trains the image-to-CLAP projection on a sampled Flickr30k metadata subset.
+
+```bash
+bash scripts/evaluate_reflectra.sh --checkpoint checkpoints/reflectra.pt
+```
+
+Downloads and unpacks the Reflectra benchmark dataset, then runs Reflectra evaluation. Omit `--checkpoint` to use the first projection checkpoint found in `checkpoints/`.
+
+```bash
+bash scripts/evaluate_clap.sh
+```
+
+Downloads and unpacks the CLAP benchmark dataset, then runs only the CLAP caption-to-audio evaluation.
+
+---
+
 ## Download Data
 
 Examples:
@@ -372,54 +233,6 @@ This writes files such as:
 
 ```text
 data/metadata/coco_karpathy_cxc_sits_val.json
-```
-
----
-
-## Create Metadata From Local Media
-
-You can create Reflectra metadata JSONL from your own audio and image folders with an OpenAI-compatible multimodal model:
-
-```bash
-python -m src.datasets.create_metadata \
-  --audio_path data/music \
-  --image_path data/my_images \
-  --source_dataset my_local_media
-```
-
-This writes:
-
-```text
-data/metadata/custom_audio_metadata.jsonl
-data/metadata/custom_image_metadata.jsonl
-```
-
-Use custom output names when needed:
-
-```bash
-python -m src.datasets.create_metadata \
-  --audio-path /path/to/music \
-  --audio-output my_music_metadata.jsonl
-```
-
-The script uses `[benchmark].model` from `configs/reflectra.toml` by default, unless `[metadata].model` or `--model` is set. Images and audio are sent to the LLM, so the selected model/server must support the corresponding media input type.
-
-For long audio files, only a middle excerpt is sent to the LLM by default:
-
-```bash
-python -m src.datasets.create_metadata \
-  --audio_path data/music \
-  --audio_clip_seconds 15
-```
-
-Use `--audio_clip_seconds 0` to send full audio files.
-
-To benchmark only this generated metadata, pass the files explicitly:
-
-```bash
-python -m src.benchmark.create_benchmark \
-  --image_metadata data/metadata/custom_image_metadata.jsonl \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl
 ```
 
 ---
@@ -486,8 +299,6 @@ data/benchmark/image_table.parquet
 data/benchmark/image_audio_scores.parquet
 ```
 
-It also writes `data/benchmark/benchmark_hf.parquet` by default. That table duplicates each scored pair into one row and stores `image` and `audio` with Hugging Face `Image` and `Audio` features, backed by embedded bytes so they can be previewed or played after upload. Use `--no-write_hf` to skip that larger viewer-friendly file.
-
 ---
 
 ## Create CLAP LLM Benchmark
@@ -499,19 +310,20 @@ python -m src.benchmark.create_clap_benchmark \
   --audio_metadata data/metadata/custom_audio_metadata.jsonl \
   --audio_samples 100 \
   --queries_per_audio 1 \
-  --num_negatives 9
+  --max_audios 10
 ```
 
-Each query uses a known caption/audio pair as the positive and random audio files as negatives. The LLM scores every candidate audio from 0 to 10 and writes:
+Each query uses an audio caption and a deterministic candidate audio set. The
+LLM scores every candidate audio from 0 to 10. The builder supports sharded
+runs with `--num_shards` and `--shard_index`, so multiple workers can score
+different query partitions and resume incomplete shards.
+
+The final Hugging Face transport tables are:
 
 ```text
-data/benchmark/clap_llm_benchmark.jsonl
-data/benchmark/clap_llm_benchmark.csv
-data/benchmark/clap_llm_benchmark.parquet
-data/benchmark/clap_llm_benchmark_manifest.json
+data/clap_benchmark/clap_llm_benchmark.parquet
+data/clap_benchmark/audio_table.parquet
 ```
-
-The audio sent to the LLM is clipped to a middle 15-second excerpt by default. Use `--audio_clip_seconds 0` for full files.
 
 ---
 
@@ -533,8 +345,7 @@ This evaluates CLAP against the LLM-scored CLAP benchmark created by `src.benchm
 
 ```bash
 python -m src.evaluation.evaluate_clap \
-  --benchmark data/benchmark/clap_llm_benchmark.jsonl \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl
+  --benchmark_dir data/clap_benchmark
 ```
 
 The script computes CLAP text-to-audio rankings for each benchmark caption over that query's positive and random-negative candidate audios.
@@ -542,14 +353,14 @@ The script computes CLAP text-to-audio rankings for each benchmark caption over 
 Metrics:
 
 ```text
-- ndcg@1, ndcg@5, ndcg@10
+- ndcg@1, ndcg@5, ndcg@max-audios
 - mrr
 - mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
+- recall@1, recall@5, recall@max-audios
+- precision@1, precision@5, precision@max-audios
 ```
 
-NDCG uses the LLM 0..10 score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant.
+NDCG uses the LLM 0..10 score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant. Metrics are computed only over audios scored for each query, so unevaluated audios are not treated as irrelevant.
 
 ---
 
@@ -590,26 +401,26 @@ For MRR, mAP, recall, and precision, every CxC score `> 0` is treated as relevan
 This evaluates the full image-to-audio system on the benchmark created by `src.benchmark.create_benchmark`.
 
 ```bash
+python -m src.datasets.downloaders.download_reflectra_benchmark
+
 python -m src.evaluation.evaluate_reflectra \
-  --benchmark data/benchmark/image_audio_scores.parquet \
-  --image_metadata data/metadata/custom_image_metadata.jsonl \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
+  --benchmark data/benchmark \
   --checkpoint checkpoints/reflectra.pt
 ```
 
-The evaluator loads image/audio paths from metadata, computes Reflectra image-to-audio similarities, and compares them with the LLM benchmark scores.
+The downloader unpacks media from the Hugging Face Parquet tables, writes JSONL indexes, and removes the local Parquet transport files. The evaluator reads those unpacked files directly.
 
 Metrics:
 
 ```text
-- ndcg@1, ndcg@5, ndcg@10
+- ndcg@1, ndcg@5, ndcg@max-audios
 - mrr
 - mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
+- recall@1, recall@5, recall@max-audios
+- precision@1, precision@5, precision@max-audios
 ```
 
-NDCG uses the benchmark LLM score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant.
+NDCG uses the benchmark LLM score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant. Metrics are computed only over audios scored for each image, so unevaluated audios are not treated as irrelevant.
 
 ---
 
@@ -646,144 +457,18 @@ Each indexed audio point should contain payload fields like:
 
 Defaults such as CLAP model name, Qdrant URL, collection name, vector size, batch size, and audio extensions come from `configs/reflectra.toml`. CLI arguments override the config.
 
-## Metrics
+## Benchmarks Used
 
-CLAP evaluation uses the LLM-scored caption-to-audio benchmark. CLIP evaluation uses CxC graded sparse relevance. Reflectra evaluation uses the created image/audio benchmark:
+Reflectra uses three benchmark sources:
 
-```text
-python -m src.evaluation.evaluate_clap
-python -m src.evaluation.evaluate_clip
-python -m src.evaluation.evaluate_reflectra
-```
+- Reflectra image-to-audio benchmark: https://huggingface.co/datasets/AraNge/reflectra-benchmark
+- Reflectra CLAP caption-to-audio benchmark: https://huggingface.co/datasets/AraNge/reflectra-clap-benchmark
+- CLIP CxC image-caption benchmark labels: https://github.com/google-research-datasets/Crisscrossed-Captions
 
-The scripts report:
-
-```text
-ndcg@K = ranking quality with relevant items rewarded near the top
-mrr = reciprocal rank of the first relevant target
-mAP = mean average precision across queries
-recall@K = relevant retrieved items in top K / total relevant items
-precision@K = relevant retrieved items in top K / K
-```
-
-CLAP NDCG uses LLM 0..10 scores as graded relevance. CLIP NDCG uses raw CxC scores as graded relevance. Reflectra NDCG uses the image/audio benchmark LLM scores as graded relevance.
-
-Recommended reporting:
-
-```text
-CLAP LLM benchmark text-to-audio:
-- ndcg@1
-- ndcg@5
-- ndcg@10
-- mrr
-- mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
-
-CLIP CxC:
-- ndcg@1
-- ndcg@5
-- ndcg@10
-- mrr
-- mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
-
-Reflectra image-to-audio:
-- ndcg@1, ndcg@5, ndcg@10
-- mrr, mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
-
-Image-to-music final system, later:
-- Precision@10 by mood/genre metadata
-- NDCG@10
-- Human rating from 1 to 5
-- Percentage of recommendations rated 4 or 5
-```
-
----
-
-## Recommended Experiments
-
-### Experiment 1: CLAP zero-shot baseline
-
-```bash
-python -m src.evaluation.evaluate_clap \
-  --benchmark data/benchmark/clap_llm_benchmark.jsonl \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl
-```
-
-Purpose:
-
-```text
-Measure pretrained CLAP against LLM-scored music-caption relevance before fine-tuning.
-```
-
-### Experiment 2: CLIP CxC baseline
-
-```bash
-python -m src.evaluation.evaluate_clip \
-  --metadata data/metadata/coco_karpathy_cxc_sits_val.json \
-  --image-root data/coco_images \
-  --max-images 1000
-```
-
-Purpose:
-
-```text
-Measure whether CLIP aligns images with captions using CxC graded relevance labels.
-```
-
-### Experiment 3: Reflectra image-to-audio benchmark
-
-```bash
-python -m src.evaluation.evaluate_reflectra \
-  --benchmark data/benchmark/image_audio_scores.parquet \
-  --image_metadata data/metadata/custom_image_metadata.jsonl \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
-  --checkpoint checkpoints/reflectra.pt
-```
-
-Purpose:
-
-```text
-Measure the trained image-to-CLAP projection against LLM-scored image/audio relevance.
-```
-
----
-
-## Development Order
-
-Recommended order:
-
-```text
-1. Install the project with pyproject.toml.
-2. Start Qdrant.
-3. Download a small sample from each dataset.
-4. Create local metadata or download dataset metadata.
-5. Create the CLAP LLM benchmark and evaluate CLAP.
-6. Prepare CxC and evaluate CLIP.
-7. Create the image/audio benchmark.
-8. Train image-to-CLAP projection only after baselines work.
-9. Evaluate Reflectra on the image/audio benchmark.
-10. Put local songs in `data/music` and index CLAP audio embeddings in Qdrant.
-11. Scale to a larger music library.
-12. Build final image-to-song demo.
-```
-
----
-
-## Notes
-
-- Do not train from scratch at the beginning.
-- Always evaluate pretrained CLAP first.
-- Keep MusicCaps and Song Describer mainly for clean testing.
-- Use MTG-Jamendo for training, validation, and scale experiments.
-- Use AudioSet carefully because it is weakly labeled general audio, not a clean music-caption dataset.
-- Use COCO and Flickr30k for image-caption evaluation.
-- Use EmoSet for image mood alignment through music-oriented captions.
-- Use Qdrant only after small local dense retrieval works correctly.
+The CLIP CxC evaluation uses CxC SITS graded semantic similarity labels on
+MS-COCO image/caption pairs. The Reflectra and CLAP benchmark repositories are
+distributed as Parquet transport tables and should be unpacked locally with the
+downloaders before evaluation.
 
 ## Dataset Links
 

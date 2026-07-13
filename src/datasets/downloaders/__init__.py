@@ -10,10 +10,12 @@ Most modules can be run directly from the command line, for example:
     python -m src.datasets.downloaders.download_mtg_jamendo --split train --number 100
     python -m src.datasets.downloaders.download_coco
     python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc
+    python -m src.datasets.downloaders.download_clap_benchmark
 """
 
 __all__ = [
     "download_audioset",
+    "download_clap_benchmark",
     "download_coco",
     "download_emoset",
     "download_flickr30k",

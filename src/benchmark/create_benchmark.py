@@ -46,8 +46,8 @@ SCORE_COLUMNS = [
     "score",
 ]
 
-AUDIO_TABLE_COLUMNS = ["audio_id", "captions", "audio", "audio_path"]
-IMAGE_TABLE_COLUMNS = ["image_id", "captions", "image", "image_path"]
+AUDIO_TABLE_COLUMNS = ["audio_id", "captions", "audio"]
+IMAGE_TABLE_COLUMNS = ["image_id", "captions", "image"]
 MATCH_TABLE_COLUMNS = ["image_id", "audio_ids", "scores"]
 HF_TABLE_COLUMNS = [
     "pair_id",
@@ -800,7 +800,6 @@ def merge_shards(args: argparse.Namespace) -> None:
             "audio_id": record["audio_id"],
             "captions": record["captions"],
             "audio": Path(record["audio_path"]).read_bytes(),
-            "audio_path": record["audio_path"],
         }
         for record in audio
     ]
@@ -809,7 +808,6 @@ def merge_shards(args: argparse.Namespace) -> None:
             "image_id": record["image_id"],
             "captions": record["captions"],
             "image": Path(record["image_path"]).read_bytes(),
-            "image_path": record["image_path"],
         }
         for record in images
     ]

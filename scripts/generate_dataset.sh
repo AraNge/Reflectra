@@ -94,6 +94,41 @@ metadata_count() {
   fi
 }
 
+shard_prefix() {
+  local shard_index="$1"
+  local num_shards="$2"
+  printf "shard_%03d-of-%03d" "$shard_index" "$num_shards"
+}
+
+json_value() {
+  local path="$1"
+  local key="$2"
+  python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]])' "$path" "$key"
+}
+
+shard_complete() {
+  local prefix manifest_path shard_path expected actual
+  prefix="$(shard_prefix "$BENCHMARK_SHARD_INDEX" "$BENCHMARK_NUM_SHARDS")"
+  manifest_path="data/benchmark/manifest_${prefix}.json"
+  shard_path="data/benchmark/benchmark_${prefix}.jsonl"
+
+  if [ ! -f "$manifest_path" ] || [ ! -f "$shard_path" ]; then
+    echo "[INFO] Shard files are not complete yet: $manifest_path / $shard_path" >&2
+    return 1
+  fi
+
+  expected="$(json_value "$manifest_path" "assigned_pair_count")"
+  actual="$(wc -l < "$shard_path")"
+
+  if [ "$actual" -lt "$expected" ]; then
+    echo "[INFO] Shard $BENCHMARK_SHARD_INDEX/$BENCHMARK_NUM_SHARDS is incomplete: $actual/$expected pairs." >&2
+    return 1
+  fi
+
+  echo "[INFO] Shard $BENCHMARK_SHARD_INDEX/$BENCHMARK_NUM_SHARDS is complete: $actual/$expected pairs." >&2
+  return 0
+}
+
 if [ "$(metadata_count "$FLICKR_METADATA")" -lt "$N" ]; then
   python -m src.datasets.downloaders.download_flickr30k --number "$N"
 fi
@@ -118,34 +153,44 @@ if [ ! -x "$LLAMA_SERVER" ]; then
   exit 1
 fi
 
-# Set to 12 layers to safely leverage your 4GB VRAM without hitting OOM limits
-"$LLAMA_SERVER" \
-  -hf "$MODEL_REPO" \
-  --alias "$MODEL_ALIAS" \
-  -c 4096 \
-  --port 8080 \
-  -ngl 12 \
-  -fit off &
+# Check if llama-server is already running
+SERVER_RUNNING=false
+if curl -s -f "http://localhost:8080/health" > /dev/null 2>&1; then
+  echo "llama-server is already running on port 8080"
+  SERVER_RUNNING=true
+else
+  echo "llama-server is not running, starting it now..."
+  
+  # Set to 12 layers to safely leverage your 4GB VRAM without hitting OOM limits
+  "$LLAMA_SERVER" \
+    -hf "$MODEL_REPO" \
+    --alias "$MODEL_ALIAS" \
+    -c 4096 \
+    --port 8080 \
+    -ngl 12 \
+    -fit off &
 
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+  SERVER_PID=$!
+  # Only set trap if we started the server
+  trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
-echo "Waiting for llama-server to download models and become ready..."
-MAX_ATTEMPTS=60
-ATTEMPT=0
-while ! curl -s -f "http://localhost:8080/health" > /dev/null; do
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "Error: llama-server process died unexpectedly before initialization." >&2
-    exit 1
-  fi
-  ATTEMPT=$((ATTEMPT + 1))
-  if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-    echo "Error: llama-server timed out waiting to start." >&2
-    exit 1
-  fi
-  sleep 5
-done
-echo "llama-server is up and running successfully!"
+  echo "Waiting for llama-server to download models and become ready..."
+  MAX_ATTEMPTS=60
+  ATTEMPT=0
+  while ! curl -s -f "http://localhost:8080/health" > /dev/null; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "Error: llama-server process died unexpectedly before initialization." >&2
+      exit 1
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+      echo "Error: llama-server timed out waiting to start." >&2
+      exit 1
+    fi
+    sleep 5
+  done
+  echo "llama-server is up and running successfully!"
+fi
 
 python -m src.benchmark.create_benchmark \
   --mode build \
@@ -161,18 +206,24 @@ python -m src.benchmark.create_benchmark \
   --audio_metadata "$SONG_DESCRIBER_METADATA"
 
 if [ "$RUN_MERGE" -eq 1 ]; then
-  python -m src.benchmark.create_benchmark \
-    --mode merge \
-    --image_samples "$N" \
-    --audio_samples "$N" \
-    --batch_size 8 \
-    --max_output_tokens 128 \
-    --model "$MODEL_ALIAS" \
-    --num_shards "$BENCHMARK_NUM_SHARDS" \
-    --max-samples "$MAX_SAMPLES" \
-    --image_metadata "$FLICKR_METADATA" \
-    --audio_metadata "$SONG_DESCRIBER_METADATA" \
-    "${MERGE_EXTRA_ARGS[@]}"
+  if shard_complete || [ "$ALLOW_INCOMPLETE_MERGE" -eq 1 ]; then
+    python -m src.benchmark.create_benchmark \
+      --mode merge \
+      --image_samples "$N" \
+      --audio_samples "$N" \
+      --batch_size 8 \
+      --max_output_tokens 128 \
+      --model "$MODEL_ALIAS" \
+      --num_shards "$BENCHMARK_NUM_SHARDS" \
+      --max-samples "$MAX_SAMPLES" \
+      --image_metadata "$FLICKR_METADATA" \
+      --audio_metadata "$SONG_DESCRIBER_METADATA" \
+      "${MERGE_EXTRA_ARGS[@]}"
+  else
+    echo "[INFO] Skipping merge because the shard is incomplete." >&2
+    echo "[INFO] Run the same command again to retry only missing pairs." >&2
+    echo "[INFO] To merge the partial shard anyway, pass --allow-incomplete-merge." >&2
+  fi
 else
   echo "[INFO] Built shard $BENCHMARK_SHARD_INDEX/$BENCHMARK_NUM_SHARDS."
   echo "[INFO] Merge after all shards are available with:"

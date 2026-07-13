@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 
 
 SparseRelevance = List[Dict[int, float]]
+SparseCandidates = Sequence[Sequence[int]] | None
 
 
-def _ranked_indices(scores: np.ndarray) -> list[int]:
-    return [int(index) for index in np.argsort(-scores)]
+def _ranked_indices(
+    scores: np.ndarray,
+    candidate_indices: Sequence[int] | None = None,
+) -> list[int]:
+    if candidate_indices is None:
+        return [int(index) for index in np.argsort(-scores)]
+
+    candidates = np.asarray(candidate_indices, dtype=np.int64)
+    ranked_candidate_positions = np.argsort(-scores[candidates])
+    return [int(candidates[position]) for position in ranked_candidate_positions]
 
 
 def _relevant_set(
@@ -50,6 +59,7 @@ def sparse_ndcg_at_k(
     relevance: SparseRelevance,
     k: int,
     exponential_gain: bool = False,
+    candidate_indices: SparseCandidates = None,
 ) -> float:
     values = []
 
@@ -58,7 +68,10 @@ def sparse_ndcg_at_k(
         if not query_relevance:
             continue
 
-        ranked = _ranked_indices(similarity[query_idx])[:k]
+        ranked = _ranked_indices(
+            similarity[query_idx],
+            candidate_indices[query_idx] if candidate_indices is not None else None,
+        )[:k]
         ranked_relevance = [
             float(query_relevance.get(target_idx, 0.0))
             for target_idx in ranked
@@ -83,6 +96,7 @@ def sparse_mrr(
     similarity: np.ndarray,
     relevance: SparseRelevance,
     threshold: float = 0.0,
+    candidate_indices: SparseCandidates = None,
 ) -> float:
     values = []
     for query_idx in range(similarity.shape[0]):
@@ -91,7 +105,10 @@ def sparse_mrr(
             continue
 
         for rank, target_idx in enumerate(
-            _ranked_indices(similarity[query_idx]),
+            _ranked_indices(
+                similarity[query_idx],
+                candidate_indices[query_idx] if candidate_indices is not None else None,
+            ),
             start=1,
         ):
             if target_idx in relevant:
@@ -105,6 +122,7 @@ def sparse_average_precision(
     similarity: np.ndarray,
     relevance: SparseRelevance,
     threshold: float = 0.0,
+    candidate_indices: SparseCandidates = None,
 ) -> float:
     values = []
 
@@ -117,7 +135,10 @@ def sparse_average_precision(
         precision_sum = 0.0
 
         for rank, target_idx in enumerate(
-            _ranked_indices(similarity[query_idx]),
+            _ranked_indices(
+                similarity[query_idx],
+                candidate_indices[query_idx] if candidate_indices is not None else None,
+            ),
             start=1,
         ):
             if target_idx not in relevant:
@@ -136,6 +157,7 @@ def sparse_recall_at_k(
     relevance: SparseRelevance,
     k: int,
     threshold: float = 0.0,
+    candidate_indices: SparseCandidates = None,
 ) -> float:
     values = []
     for query_idx in range(similarity.shape[0]):
@@ -143,7 +165,12 @@ def sparse_recall_at_k(
         if not relevant:
             continue
 
-        top_k = set(_ranked_indices(similarity[query_idx])[:k])
+        top_k = set(
+            _ranked_indices(
+                similarity[query_idx],
+                candidate_indices[query_idx] if candidate_indices is not None else None,
+            )[:k]
+        )
         values.append(len(top_k & relevant) / len(relevant))
 
     return float(np.mean(values)) if values else 0.0
@@ -154,6 +181,7 @@ def sparse_precision_at_k(
     relevance: SparseRelevance,
     k: int,
     threshold: float = 0.0,
+    candidate_indices: SparseCandidates = None,
 ) -> float:
     values = []
     for query_idx in range(similarity.shape[0]):
@@ -161,7 +189,10 @@ def sparse_precision_at_k(
         if not relevant:
             continue
 
-        ranked = _ranked_indices(similarity[query_idx])[:k]
+        ranked = _ranked_indices(
+            similarity[query_idx],
+            candidate_indices[query_idx] if candidate_indices is not None else None,
+        )[:k]
         if not ranked:
             continue
 
@@ -170,23 +201,50 @@ def sparse_precision_at_k(
     return float(np.mean(values)) if values else 0.0
 
 
+def effective_ks(
+    ks: tuple[int, ...],
+    candidate_indices: SparseCandidates = None,
+) -> tuple[int, ...]:
+    values = []
+    max_candidates = None
+
+    if candidate_indices is not None:
+        max_candidates = max((len(row) for row in candidate_indices), default=0)
+
+    for k in ks:
+        if k < 1:
+            continue
+
+        effective_k = min(k, max_candidates) if max_candidates is not None else k
+        if effective_k < 1 or effective_k in values:
+            continue
+        values.append(effective_k)
+
+    return tuple(values)
+
+
 def sparse_retrieval_metrics(
     similarity: np.ndarray,
     relevance: SparseRelevance,
+    candidate_indices: SparseCandidates = None,
     ks: tuple[int, ...] = (1, 5, 10),
     threshold: float = 0.0,
     exponential_gain: bool = False,
 ) -> dict[str, float]:
+    ks = effective_ks(ks, candidate_indices=candidate_indices)
+
     metrics = {
         "mrr": sparse_mrr(
             similarity=similarity,
             relevance=relevance,
             threshold=threshold,
+            candidate_indices=candidate_indices,
         ),
         "mAP": sparse_average_precision(
             similarity=similarity,
             relevance=relevance,
             threshold=threshold,
+            candidate_indices=candidate_indices,
         ),
         "num_queries": sum(1 for row in relevance if row),
     }
@@ -197,18 +255,21 @@ def sparse_retrieval_metrics(
             relevance=relevance,
             k=k,
             exponential_gain=exponential_gain,
+            candidate_indices=candidate_indices,
         )
         metrics[f"recall@{k}"] = sparse_recall_at_k(
             similarity=similarity,
             relevance=relevance,
             k=k,
             threshold=threshold,
+            candidate_indices=candidate_indices,
         )
         metrics[f"precision@{k}"] = sparse_precision_at_k(
             similarity=similarity,
             relevance=relevance,
             k=k,
             threshold=threshold,
+            candidate_indices=candidate_indices,
         )
 
     return metrics

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -14,28 +12,37 @@ from tqdm import tqdm
 
 from src.config import get_nested, load_config
 from src.datasets.selection import deterministic_sample, load_audio_metadata
-from src.metrics.retrieval_metrics import sparse_retrieval_metrics
-from src.utils.audio import audio_payload_for_llm
 from src.utils.hashing import stable_hash_id
 from src.utils.json import read_jsonl, write_json, write_jsonl
-from src.utils.media_tables import load_audio_table
 from src.utils.openai_client import create_openai_client
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_AUDIO_TABLE_PATH = PROJECT_ROOT / "data" / "benchmark" / "audio_table.parquet"
 DEFAULT_AUDIO_METADATA_PATH = (
     PROJECT_ROOT / "data" / "metadata" / "song_describer_metadata.jsonl"
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "clap_benchmark"
+AUDIO_TABLE_COLUMNS = ["audio_id", "captions", "audio"]
+SCORE_TABLE_COLUMNS = ["query_id", "caption", "audio_ids", "scores"]
+PAIR_TABLE_COLUMNS = [
+    "query_id",
+    "caption",
+    "audio_id",
+    "score",
+]
 
 PROMPT = """
 Return only minified JSON. No markdown. No explanation.
-Task: score each audio clip against this caption from 0 to 10, if you are 
+Task: score each audio item against this caption from 0 to 10, if you are 
 not sure do not put high score, so better underestimate than overestimate.
 Keys must be exactly the supplied audio IDs. Values must be integers.
+Use string keys. Example key: "song_describer_123".
+Use the audio descriptions as the evidence for mood, genre, instruments, 
+energy, atmosphere, and semantic fit.
 Caption: {caption}
-Example shape: {{"audio_id":8}}
+Audio descriptions:
+{audio_descriptions}
+Example shape: {{"song_describer_123":8}}
 """
 
 
@@ -48,6 +55,9 @@ def response_text(response: Any) -> str:
 
 def parse_scores(text: str, expected_audio_ids: set[str]) -> dict[str, int]:
     text = text.strip()
+    if not text:
+        raise ValueError("Model response was empty.")
+
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
@@ -78,64 +88,71 @@ def parse_scores(text: str, expected_audio_ids: set[str]) -> dict[str, int]:
     return scores
 
 
-def score_audio_candidates(
+def format_captions(captions: Any) -> str:
+    if captions is None:
+        return ""
+    if not isinstance(captions, list):
+        captions = [captions]
+
+    lines = []
+    for index, caption in enumerate(captions):
+        caption = str(caption).strip()
+        if caption:
+            lines.append(f"{index + 1}. {caption}")
+
+    return "\n".join(lines)
+
+
+def build_prompt(caption: str, audio_records: list[dict[str, Any]]) -> str:
+    audio_descriptions = "\n\n".join(
+        (
+            f"{audio_record['audio_id']}:\n"
+            f"{format_captions(audio_record.get('captions', []))}"
+        )
+        for audio_record in audio_records
+    )
+    return PROMPT.format(
+        caption=caption,
+        audio_descriptions=audio_descriptions,
+    )
+
+
+def score_audio_records(
     client: OpenAI,
     caption: str,
-    candidates: list[dict[str, Any]],
+    audio_records: list[dict[str, Any]],
     model: str,
     max_attempts: int,
     audio_clip_seconds: float | None,
     max_output_tokens: int,
-) -> dict[str, int]:
-    content: list[dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": PROMPT.format(caption=caption),
-        }
-    ]
-
-    for candidate in candidates:
-        audio_bytes, audio_format = audio_payload_for_llm(
-            candidate["audio_path"],
-            clip_seconds=audio_clip_seconds,
-        )
-        content.append(
-            {
-                "type": "input_text",
-                "text": f"Audio ID: {candidate['audio_id']}",
-            }
-        )
-        content.append(
-            {
-                "type": "input_audio",
-                "input_audio": {
-                    "data": base64.b64encode(audio_bytes).decode("ascii"),
-                    "format": audio_format,
-                },
-            }
-        )
-
-    expected_audio_ids = {candidate["audio_id"] for candidate in candidates}
+) -> dict[str, int] | None:
+    _ = audio_clip_seconds
+    expected_audio_ids = {record["audio_id"] for record in audio_records}
+    prompt = build_prompt(caption=caption, audio_records=audio_records)
+    last_error: Exception | None = None
+    last_text = ""
 
     for attempt in range(max_attempts):
         try:
             response = client.responses.create(
                 model=model,
-                input=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
+                input=prompt,
                 max_output_tokens=max_output_tokens,
             )
-            return parse_scores(response_text(response), expected_audio_ids)
-        except Exception:
-            if attempt + 1 >= max_attempts:
-                raise
-            time.sleep(2**attempt)
+            last_text = response_text(response)
+            return parse_scores(last_text, expected_audio_ids)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(2**attempt)
 
-    raise RuntimeError("Scoring failed unexpectedly.")
+    preview = last_text.strip().replace("\n", " ")[:200]
+    tqdm.write(
+        "[WARN] Skipping CLAP query after "
+        f"{max_attempts} failed scoring attempt(s): {last_error}. "
+        f"Response preview: {preview!r}"
+    )
+    return None
 
 
 def iter_queries(
@@ -145,8 +162,16 @@ def iter_queries(
     queries = []
 
     for record in records:
-        captions = record.get("captions", [])[:queries_per_audio]
-        for caption_index, caption in enumerate(captions):
+        raw_captions = record.get("captions", [])
+        if raw_captions is None:
+            captions = []
+        elif isinstance(raw_captions, list):
+            captions = raw_captions
+        else:
+            captions = [raw_captions]
+
+        caption_limit = min(len(captions), queries_per_audio)
+        for caption_index, caption in enumerate(captions[:caption_limit]):
             caption = str(caption).strip()
             if caption:
                 queries.append((record, caption, caption_index))
@@ -168,10 +193,10 @@ def benchmark_row(
     query_record: dict[str, Any],
     caption: str,
     caption_index: int,
-    candidates: list[dict[str, Any]],
+    audio_records: list[dict[str, Any]],
     scores: dict[str, int],
 ) -> dict[str, Any]:
-    audio_ids = [candidate["audio_id"] for candidate in candidates]
+    audio_ids = [record["audio_id"] for record in audio_records]
     return {
         "query_id": make_query_id(
             query_record["audio_id"],
@@ -179,75 +204,68 @@ def benchmark_row(
             caption_index,
         ),
         "caption": caption,
-        "positive_audio_id": query_record["audio_id"],
-        "candidate_audio_ids": audio_ids,
+        "audio_ids": audio_ids,
         "scores": [int(scores[audio_id]) for audio_id in audio_ids],
-        "relevance": {
-            audio_id: int(scores[audio_id])
-            for audio_id in audio_ids
-        },
     }
 
 
-def existing_query_ids(path: Path) -> set[str]:
-    return {
-        str(row["query_id"])
-        for row in read_jsonl(path, missing_ok=True)
-        if row.get("query_id")
-    }
-
-
-def compute_oracle_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
-    if not rows:
-        return {}
-
-    max_candidates = max(len(row["candidate_audio_ids"]) for row in rows)
-    similarity = []
-    relevance = []
-
-    for row in rows:
-        scores = list(row["scores"])
-        padded_scores = scores + [-1_000_000.0] * (max_candidates - len(scores))
-        similarity.append(padded_scores)
-        relevance.append(
-            {
-                index: float(score)
-                for index, score in enumerate(scores)
-                if float(score) > 0
-            }
-        )
-
-    return sparse_retrieval_metrics(
-        similarity=pd.DataFrame(similarity).to_numpy(dtype=float),
-        relevance=relevance,
-        exponential_gain=True,
+def dataset_fingerprint(
+    records: list[dict[str, Any]],
+    queries_per_audio: int,
+    seed: int,
+) -> str:
+    signature = [
+        {
+            "audio_id": record["audio_id"],
+            "captions": record["captions"],
+            "audio_path": record["audio_path"],
+            "source_dataset": record.get("source_dataset"),
+            "split": record.get("split"),
+        }
+        for record in records
+    ]
+    return stable_hash_id(
+        "clap_benchmark_dataset",
+        signature,
+        queries_per_audio,
+        seed,
+        prefix="dataset_",
+        length=48,
     )
+
+
+def shard_for_query(query_id: str, num_shards: int) -> int:
+    digest = query_id.removeprefix("query_")
+    return int(digest, 16) % num_shards
+
+
+def accepted_query_rows(path: Path, force: bool) -> list[dict[str, Any]]:
+    if force:
+        return []
+
+    rows = []
+    for row in read_jsonl(path, missing_ok=True):
+        scores = [int(score) for score in row.get("scores", [])]
+        if scores and any(score > 0 for score in scores):
+            rows.append(row)
+
+    return rows
 
 
 def build_benchmark(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    temp_parent = output_dir / "tmp"
-    temp_parent.mkdir(parents=True, exist_ok=True)
 
-    if args.audio_metadata:
-        all_audio_records = load_audio_metadata(args.audio_metadata)
-        build_benchmark_from_records(args, all_audio_records, output_dir)
-        return
+    all_audio_records = load_audio_metadata(args.audio_metadata)
+    build_benchmark_from_records(args, all_audio_records, output_dir)
 
-    audio_table_path = Path(args.audio_table).expanduser().resolve()
-    with tempfile.TemporaryDirectory(
-        prefix="clap_benchmark_",
-        dir=temp_parent,
-    ) as temp_dir:
-        all_audio_records = list(
-            load_audio_table(
-                path=audio_table_path,
-                materialize_dir=Path(temp_dir),
-                project_root=PROJECT_ROOT,
-            ).values()
-        )
-        build_benchmark_from_records(args, all_audio_records, output_dir)
+
+def shard_prefix(shard_index: int, num_shards: int) -> str:
+    width = max(3, len(str(num_shards - 1)))
+    return (
+        f"shard_{shard_index:0{width}d}"
+        f"-of-{num_shards:0{width}d}"
+    )
 
 
 def audio_for_query(
@@ -259,16 +277,10 @@ def audio_for_query(
     seed: int,
 ) -> list[dict[str, Any]]:
     if max_audios is None or max_audios >= len(records):
-        candidates = records
+        audio_records = records
     else:
-        negative_count = max_audios - 1
-        negatives = [
-            record
-            for record in records
-            if record["audio_id"] != query_record["audio_id"]
-        ]
-        negatives = sorted(
-            negatives,
+        audio_records = sorted(
+            records,
             key=lambda record: (
                 stable_hash_id(
                     "clap_audio_per_query",
@@ -281,14 +293,13 @@ def audio_for_query(
                 ),
                 record["audio_id"],
             ),
-        )[:negative_count]
-        candidates = [query_record] + negatives
+        )[:max_audios]
 
     return sorted(
-        candidates,
+        audio_records,
         key=lambda record: (
             stable_hash_id(
-                "clap_audio_candidate_order",
+                "clap_audio_pair_order",
                 seed,
                 query_record["audio_id"],
                 caption_index,
@@ -307,11 +318,51 @@ def write_audio_table(records: list[dict[str, Any]], output_dir: Path) -> None:
             "audio_id": record["audio_id"],
             "captions": record["captions"],
             "audio": Path(record["audio_path"]).read_bytes(),
-            "audio_path": record["audio_path"],
         }
         for record in records
     ]
-    pd.DataFrame(rows).to_parquet(output_dir / "audio_table.parquet", index=False)
+    pd.DataFrame(rows, columns=AUDIO_TABLE_COLUMNS).to_parquet(
+        output_dir / "audio_table.parquet",
+        index=False,
+    )
+
+
+def write_score_table(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    normalized_rows = [
+        {
+            "query_id": str(row["query_id"]),
+            "caption": str(row["caption"]),
+            "audio_ids": [str(audio_id) for audio_id in row["audio_ids"]],
+            "scores": [int(score) for score in row["scores"]],
+        }
+        for row in rows
+    ]
+    pd.DataFrame(normalized_rows, columns=SCORE_TABLE_COLUMNS).to_parquet(
+        output_dir / "clap_llm_benchmark.parquet",
+        index=False,
+    )
+
+
+def pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pairs = []
+    for row in rows:
+        for audio_id, score in zip(row["audio_ids"], row["scores"]):
+            pairs.append(
+                {
+                    "query_id": row["query_id"],
+                    "caption": row["caption"],
+                    "audio_id": audio_id,
+                    "score": int(score),
+                }
+            )
+    return pairs
+
+
+def write_pair_csv(path: Path, pairs: list[dict[str, Any]]) -> None:
+    pd.DataFrame(pairs, columns=PAIR_TABLE_COLUMNS).to_csv(
+        path,
+        index=False,
+    )
 
 
 def build_benchmark_from_records(
@@ -325,6 +376,12 @@ def build_benchmark_from_records(
         seed=args.random_seed,
         id_field="audio_id",
     )
+    if len(records) < args.audio_samples:
+        print(
+            "[WARN] Requested "
+            f"{args.audio_samples} audio samples, but only {len(records)} "
+            "usable records are available."
+        )
 
     if len(records) < 2:
         raise ValueError("At least two audio records are required.")
@@ -334,109 +391,216 @@ def build_benchmark_from_records(
             f"need {args.max_audios}, found {len(records)}."
         )
 
+    fingerprint = dataset_fingerprint(
+        records=records,
+        queries_per_audio=args.queries_per_audio,
+        seed=args.random_seed,
+    )
+
     client = create_openai_client(
         api_key=args.api_key,
         api_key_env=args.api_key_env,
         base_url=args.base_url,
         config=args.config_data,
     )
-    output_path = output_dir / args.output_name
-    completed = set() if args.force else existing_query_ids(output_path)
+
+    prefix = shard_prefix(
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+    )
+    shard_path = output_dir / f"clap_benchmark_{prefix}.jsonl"
+    shard_csv_path = output_dir / f"clap_benchmark_{prefix}.csv"
+    manifest_path = output_dir / f"clap_manifest_{prefix}.json"
+
     rows_to_write = []
-    all_rows = [] if args.force else read_jsonl(output_path, missing_ok=True)
+    all_rows = accepted_query_rows(shard_path, force=args.force)
+    completed = {
+        str(row["query_id"])
+        for row in all_rows
+        if row.get("query_id")
+    }
 
-    queries = iter_queries(records, args.queries_per_audio)
+    target_queries = iter_queries(records, args.queries_per_audio)
     if args.max_queries is not None:
-        queries = queries[:args.max_queries]
-
-    for query_record, caption, caption_index in tqdm(
-        queries,
-        desc="Score CLAP benchmark",
-        unit="query",
-    ):
-        query_id = make_query_id(
-            query_record["audio_id"],
-            caption,
-            caption_index,
-        )
-        if query_id in completed and not args.force:
-            continue
-
-        candidates = audio_for_query(
-            query_record=query_record,
-            caption=caption,
-            caption_index=caption_index,
-            records=records,
-            max_audios=args.max_audios,
+        target_queries = target_queries[:args.max_queries]
+    query_pool = iter_queries(
+        deterministic_sample(
+            records=all_audio_records,
+            count=len(all_audio_records),
             seed=args.random_seed,
-        )
+            id_field="audio_id",
+        ),
+        args.queries_per_audio,
+    )
 
-        scores = score_audio_candidates(
-            client=client,
-            caption=caption,
-            candidates=candidates,
-            model=args.model,
-            max_attempts=args.max_attempts,
-            audio_clip_seconds=args.audio_clip_seconds,
-            max_output_tokens=args.max_output_tokens,
+    total_pair_count = sum(
+        len(
+            audio_for_query(
+                query_record=query_record,
+                caption=caption,
+                caption_index=caption_index,
+                records=records,
+                max_audios=args.max_audios,
+                seed=args.random_seed,
+            )
         )
-        row = benchmark_row(
-            query_record=query_record,
-            caption=caption,
-            caption_index=caption_index,
-            candidates=candidates,
-            scores=scores,
+        for query_record, caption, caption_index in target_queries
+    )
+    assigned_pair_count = sum(
+        len(
+            audio_for_query(
+                query_record=query_record,
+                caption=caption,
+                caption_index=caption_index,
+                records=records,
+                max_audios=args.max_audios,
+                seed=args.random_seed,
+            )
         )
-        rows_to_write.append(row)
-        all_rows.append(row)
+        for query_record, caption, caption_index in target_queries
+        if shard_for_query(
+            make_query_id(query_record["audio_id"], caption, caption_index),
+            args.num_shards,
+        )
+        == args.shard_index
+    )
 
-        if len(rows_to_write) >= args.flush_every:
-            write_jsonl(output_path, all_rows)
-            rows_to_write = []
+    write_json(
+        manifest_path,
+        {
+            "dataset_fingerprint": fingerprint,
+            "num_shards": args.num_shards,
+            "shard_index": args.shard_index,
+            "audio_count": len(records),
+            "max_audios": args.max_audios,
+            "queries_per_audio": args.queries_per_audio,
+            "total_pair_count": total_pair_count,
+            "assigned_pair_count": assigned_pair_count,
+            "random_seed": args.random_seed,
+            "audio_samples": args.audio_samples,
+            "model": args.model,
+        },
+    )
+    if not shard_path.exists() or args.force:
+        write_jsonl(shard_path, [])
+    if not shard_csv_path.exists() or args.force:
+        write_pair_csv(shard_csv_path, [])
 
-    write_jsonl(output_path, all_rows)
-    pd.DataFrame(all_rows).to_csv(output_path.with_suffix(".csv"), index=False)
+    accepted_pair_count = len(pair_rows(all_rows))
+
+    with tqdm(
+        total=assigned_pair_count,
+        initial=min(accepted_pair_count, assigned_pair_count),
+        desc="Score CLAP benchmark",
+        unit="pair",
+    ) as progress:
+        for start in range(0, len(query_pool), args.batch_size):
+            if accepted_pair_count >= assigned_pair_count:
+                break
+
+            query_batch = query_pool[start:start + args.batch_size]
+
+            for query_record, caption, caption_index in query_batch:
+                if accepted_pair_count >= assigned_pair_count:
+                    break
+
+                query_id = make_query_id(
+                    query_record["audio_id"],
+                    caption,
+                    caption_index,
+                )
+                audio_records = audio_for_query(
+                    query_record=query_record,
+                    caption=caption,
+                    caption_index=caption_index,
+                    records=records,
+                    max_audios=args.max_audios,
+                    seed=args.random_seed,
+                )
+
+                if shard_for_query(query_id, args.num_shards) != args.shard_index:
+                    continue
+
+                if query_id in completed and not args.force:
+                    continue
+
+                scores = score_audio_records(
+                    client=client,
+                    caption=caption,
+                    audio_records=audio_records,
+                    model=args.model,
+                    max_attempts=args.max_attempts,
+                    audio_clip_seconds=args.audio_clip_seconds,
+                    max_output_tokens=args.max_output_tokens,
+                )
+                if scores is None:
+                    continue
+
+                if all(score == 0 for score in scores.values()):
+                    tqdm.write(
+                        "[WARN] Skipping CLAP query because all scored "
+                        f"audio records were zero: {query_id}"
+                    )
+                    continue
+
+                row = benchmark_row(
+                    query_record=query_record,
+                    caption=caption,
+                    caption_index=caption_index,
+                    audio_records=audio_records,
+                    scores=scores,
+                )
+                rows_to_write.append(row)
+                all_rows.append(row)
+                completed.add(query_id)
+
+                progress.update(len(audio_records))
+                accepted_pair_count += len(audio_records)
+
+            if len(rows_to_write) >= args.flush_every:
+                write_jsonl(shard_path, all_rows)
+                write_pair_csv(shard_csv_path, pair_rows(all_rows))
+                rows_to_write = []
+
+    write_jsonl(shard_path, all_rows)
+    pairs = pair_rows(all_rows)
+    write_pair_csv(shard_csv_path, pairs)
 
     try:
-        pd.DataFrame(all_rows).to_parquet(
-            output_path.with_suffix(".parquet"),
-            index=False,
-        )
-        write_audio_table(records, output_dir)
+        if args.num_shards == 1:
+            write_score_table(all_rows, output_dir)
+            write_audio_table(records, output_dir)
     except Exception as exc:
-        print(f"[WARN] Parquet output was skipped: {exc}")
+        print(f"[WARN] Audio table output was skipped: {exc}")
 
-    manifest = {
-        "num_queries": len(all_rows),
-        "audio_samples": len(records),
-        "max_audios": args.max_audios,
-        "queries_per_audio": args.queries_per_audio,
-        "model": args.model,
-        "random_seed": args.random_seed,
-        "audio_clip_seconds": args.audio_clip_seconds,
-        "audio_table": str((output_dir / "audio_table.parquet").resolve()),
-        "audio_metadata": [
-            str(Path(path).expanduser().resolve())
-            for path in args.audio_metadata
-        ],
-        "oracle_metrics_from_llm_scores": compute_oracle_metrics(all_rows),
-    }
-    write_json(output_path.with_name("clap_llm_benchmark_manifest.json"), manifest)
-    print(f"Wrote CLAP LLM benchmark to {output_path}")
+    if args.num_shards == 1:
+        write_json(
+            output_dir / "clap_benchmark_manifest.json",
+            {
+                "dataset_fingerprint": fingerprint,
+                "num_shards": args.num_shards,
+                "max_audios": args.max_audios,
+                "queries_per_audio": args.queries_per_audio,
+                "expected_pair_count": total_pair_count,
+                "actual_pair_count": len(pairs),
+                "complete": len(pairs) == total_pair_count,
+            },
+        )
+
+    if len(pairs) < assigned_pair_count:
+        print(
+            "[WARN] CLAP shard is incomplete after exhausting replacement "
+            f"queries: {len(pairs)}/{assigned_pair_count} pairs."
+        )
+    print(f"Wrote CLAP LLM benchmark shard to {shard_path}")
 
 
 def parse_args() -> argparse.Namespace:
-    config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", default=None)
-    config_args, _ = config_parser.parse_known_args()
-    config = load_config(config_args.config)
-    benchmark_config = config.get("benchmark", {})
+    config = load_config()
 
     parser = argparse.ArgumentParser(
         description="Create an LLM-scored caption-to-audio benchmark for CLAP.",
-        parents=[config_parser],
     )
-    parser.add_argument("--audio_table", default=str(DEFAULT_AUDIO_TABLE_PATH))
     parser.add_argument(
         "--audio_metadata",
         type=str,
@@ -444,12 +608,18 @@ def parse_args() -> argparse.Namespace:
         default=[str(DEFAULT_AUDIO_METADATA_PATH)],
         help=(
             "Audio metadata JSONL path(s). Defaults to Song Describer. "
-            "Pass no values plus --audio_table to build from a parquet table."
+            "Audio files are read from the audio_path values in metadata."
         ),
     )
     parser.add_argument("--audio_samples", type=int, default=100)
     parser.add_argument("--queries_per_audio", type=int, default=1)
     parser.add_argument("--max_queries", type=int, default=None)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=int(get_nested(config, "benchmark", "batch_size", 4)),
+        help="Number of caption queries to process before flush checks.",
+    )
     parser.add_argument(
         "--max-audios",
         "--max_audios",
@@ -457,8 +627,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help=(
-            "Maximum total audio candidates per caption query, "
-            "including the positive."
+            "Maximum total audio records to score per caption query."
         ),
     )
     parser.add_argument(
@@ -474,7 +643,16 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         default=str(DEFAULT_OUTPUT_DIR),
     )
-    parser.add_argument("--output_name", default="clap_llm_benchmark.jsonl")
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+    )
     parser.add_argument(
         "--base_url",
         default=get_nested(config, "llm", "base_url", "") or None,
@@ -494,12 +672,15 @@ def parse_args() -> argparse.Namespace:
         default=int(get_nested(config, "llm", "max_output_tokens", 128)),
         help="Maximum tokens the LLM may generate for each JSON scoring reply.",
     )
-    parser.add_argument("--flush_every", type=int, default=10)
+    parser.add_argument("--flush_every", type=int, default=1)
     parser.add_argument(
         "--audio_clip_seconds",
         type=float,
         default=15.0,
-        help="Use only a middle clip when audio is longer than this. Use 0 for full audio.",
+        help=(
+            "Retained for compatibility; local text LLM scoring uses audio "
+            "descriptions instead of raw audio."
+        ),
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -510,6 +691,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--queries_per_audio must be at least 1.")
     if args.max_audios is not None and args.max_audios < 2:
         parser.error("--max_audios must be at least 2.")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be at least 1.")
+    if args.num_shards < 1:
+        parser.error("--num_shards must be at least 1.")
+    if not 0 <= args.shard_index < args.num_shards:
+        parser.error(
+            "--shard_index must satisfy 0 <= shard_index < num_shards."
+        )
     if args.max_attempts < 1:
         parser.error("--max_attempts must be at least 1.")
     if args.max_output_tokens < 16:

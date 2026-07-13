@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +15,22 @@ from src.utils.benchmark_tables import (
     referenced_reflectra_media_ids,
     resolve_reflectra_benchmark_paths,
 )
-from src.utils.json import write_json
-from src.utils.media_tables import load_media_tables
+from src.utils.json import read_jsonl, write_json
+from src.utils.media_tables import resolve_media_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCHMARK_PATH = PROJECT_ROOT / "data" / "benchmark" / "image_audio_scores.parquet"
+DEFAULT_BENCHMARK_PATH = PROJECT_ROOT / "data" / "benchmark"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "evaluation_results" / "reflectra_eval_results.json"
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+CHECKPOINT_PATTERNS = ("*.pt", "*.pth")
 
 
 def build_eval_inputs(
     score_rows: list[dict[str, Any]],
     images_by_id: dict[str, dict[str, Any]],
     audio_by_id: dict[str, dict[str, Any]],
-) -> tuple[list[str], list[str], SparseRelevance]:
+) -> tuple[list[str], list[str], SparseRelevance, list[list[int]]]:
     image_ids = [row["image_id"] for row in score_rows]
     audio_ids = sorted(
         {
@@ -43,22 +44,27 @@ def build_eval_inputs(
     missing_audio = sorted(set(audio_ids) - set(audio_by_id))
 
     if missing_images:
-        raise RuntimeError(f"Missing image_table.parquet rows for IDs: {missing_images[:10]}")
+        raise RuntimeError(f"Missing benchmark image rows for IDs: {missing_images[:10]}")
     if missing_audio:
-        raise RuntimeError(f"Missing audio_table.parquet rows for IDs: {missing_audio[:10]}")
+        raise RuntimeError(f"Missing benchmark audio rows for IDs: {missing_audio[:10]}")
 
     audio_index_by_id = {
         audio_id: index
         for index, audio_id in enumerate(audio_ids)
     }
     relevance: SparseRelevance = []
+    candidate_indices: list[list[int]] = []
 
     for row in score_rows:
         query_relevance = {}
+        query_candidates = []
         for audio_id, score in zip(row["audio_ids"], row["scores"]):
+            audio_index = audio_index_by_id[audio_id]
+            query_candidates.append(audio_index)
             if float(score) > 0:
-                query_relevance[audio_index_by_id[audio_id]] = float(score)
+                query_relevance[audio_index] = float(score)
         relevance.append(query_relevance)
+        candidate_indices.append(query_candidates)
 
     image_paths = [
         images_by_id[image_id]["image_path"]
@@ -68,31 +74,92 @@ def build_eval_inputs(
         audio_by_id[audio_id]["audio_path"]
         for audio_id in audio_ids
     ]
-    return image_paths, audio_paths, relevance
+    return image_paths, audio_paths, relevance, candidate_indices
+
+
+def load_unpacked_media_index(
+    path: Path,
+    id_column: str,
+    path_column: str,
+    dataset_dir: Path,
+    required_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing unpacked benchmark index: {path}. "
+            "Run python -m src.datasets.downloaders.download_reflectra_benchmark first."
+        )
+
+    records: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(path):
+        media_id = str(row[id_column])
+        if media_id not in required_ids:
+            continue
+
+        if path_column not in row:
+            raise ValueError(f"{path.name} row {media_id} is missing {path_column}.")
+
+        media_path = resolve_media_path(
+            path_value=str(row[path_column]),
+            project_root=PROJECT_ROOT,
+            dataset_dir=dataset_dir,
+        )
+        if not media_path.exists():
+            raise FileNotFoundError(f"Unpacked media file not found: {media_path}")
+
+        records[media_id] = {
+            id_column: media_id,
+            path_column: str(media_path),
+            "captions": row.get("captions", []),
+        }
+
+    return records
+
+
+def checkpoint_has_projection_head(path: Path) -> bool:
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint["projection_state_dict"]
+    except Exception as error:
+        print(f"Skipping checkpoint without projection_state_dict {path}: {error}")
+        return False
+
+    return True
+
+
+def find_default_projection_checkpoint() -> Path | None:
+    if not DEFAULT_CHECKPOINT_DIR.exists():
+        return None
+
+    candidates: list[Path] = []
+    for pattern in CHECKPOINT_PATTERNS:
+        candidates.extend(DEFAULT_CHECKPOINT_DIR.glob(pattern))
+
+    for path in sorted(set(candidates)):
+        if checkpoint_has_projection_head(path):
+            return path
+
+    return None
 
 
 def load_reflectra_model(args: argparse.Namespace) -> ReflectraModel:
+    checkpoint = args.checkpoint
+    if checkpoint is None:
+        checkpoint = find_default_projection_checkpoint()
+        if checkpoint is None:
+            print(f"No projection checkpoint found in {DEFAULT_CHECKPOINT_DIR}.")
+        else:
+            print(f"Using projection checkpoint: {checkpoint}")
+            args.checkpoint = str(checkpoint)
+
     model = ReflectraModel(
         clip_model_name=args.clip_model,
         clap_model_name=args.clap_model,
         projection_type=args.projection_type,
         projection_hidden_dim=args.projection_hidden_dim,
         projection_dropout=args.projection_dropout,
-        device=args.device,
+        projection_checkpoint=checkpoint,
     )
-
-    if args.checkpoint:
-        checkpoint = torch.load(
-            args.checkpoint,
-            map_location=model.device,
-        )
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        load_result = model.load_state_dict(
-            state_dict,
-            strict=args.strict_checkpoint,
-        )
-        if not args.strict_checkpoint:
-            print(f"Checkpoint load result: {load_result}")
 
     model.eval()
     return model
@@ -127,9 +194,8 @@ def parse_args() -> argparse.Namespace:
         "--benchmark",
         default=str(DEFAULT_BENCHMARK_PATH),
         help=(
-            "Path to a benchmark directory containing image_audio_scores.parquet, "
-            "image_table.parquet, and audio_table.parquet, or directly to the "
-            "image_audio_scores parquet/jsonl file."
+            "Path to an unpacked benchmark directory containing images/, audio/, "
+            "image_audio_scores.jsonl, image_table.jsonl, and audio_table.jsonl."
         ),
     )
     parser.add_argument(
@@ -148,9 +214,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projection_hidden_dim", type=int, default=1024)
     parser.add_argument("--projection_dropout", type=float, default=0.1)
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--strict_checkpoint", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--device", default=None)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument("--relevance-threshold", type=float, default=0.0)
     return parser.parse_args()
@@ -163,51 +227,53 @@ def main() -> None:
     )
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_parent = output_path.parent / "tmp"
-    temp_parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(
-        prefix="reflectra_eval_",
-        dir=temp_parent,
-    ) as temp_dir:
-        score_rows = load_reflectra_score_rows(benchmark_path)
-        required_image_ids, required_audio_ids = referenced_reflectra_media_ids(score_rows)
-        images_by_id, audio_by_id = load_media_tables(
-            dataset_dir=benchmark_dir,
-            materialize_dir=Path(temp_dir),
-            project_root=PROJECT_ROOT,
-            required_image_ids=required_image_ids,
-            required_audio_ids=required_audio_ids,
-        )
-        image_paths, audio_paths, relevance = build_eval_inputs(
-            score_rows=score_rows,
-            images_by_id=images_by_id,
-            audio_by_id=audio_by_id,
-        )
+    score_rows = load_reflectra_score_rows(benchmark_path)
+    required_image_ids, required_audio_ids = referenced_reflectra_media_ids(score_rows)
+    images_by_id = load_unpacked_media_index(
+        path=benchmark_dir / "image_table.jsonl",
+        id_column="image_id",
+        path_column="image_path",
+        dataset_dir=benchmark_dir,
+        required_ids=required_image_ids,
+    )
+    audio_by_id = load_unpacked_media_index(
+        path=benchmark_dir / "audio_table.jsonl",
+        id_column="audio_id",
+        path_column="audio_path",
+        dataset_dir=benchmark_dir,
+        required_ids=required_audio_ids,
+    )
+    image_paths, audio_paths, relevance, candidate_indices = build_eval_inputs(
+        score_rows=score_rows,
+        images_by_id=images_by_id,
+        audio_by_id=audio_by_id,
+    )
 
-        if not image_paths or not audio_paths:
-            raise RuntimeError("No valid benchmark media found.")
+    if not image_paths or not audio_paths:
+        raise RuntimeError("No valid benchmark media found.")
 
-        model = load_reflectra_model(args)
-        audio_embeddings = encode_audio_in_batches(
-            model=model,
-            audio_paths=audio_paths,
-            batch_size=args.batch_size,
-        )
+    model = load_reflectra_model(args)
+    audio_embeddings = encode_audio_in_batches(
+        model=model,
+        audio_paths=audio_paths,
+        batch_size=args.batch_size,
+    )
 
-        similarities = []
+    similarities = []
 
-        for start in range(0, len(image_paths), args.batch_size):
-            batch_image_paths = image_paths[start:start + args.batch_size]
-            with torch.no_grad():
-                image_embeddings = model.encode_image(batch_image_paths).cpu()
-                batch_similarity = image_embeddings @ audio_embeddings.T
-            similarities.append(batch_similarity.cpu())
+    for start in range(0, len(image_paths), args.batch_size):
+        batch_image_paths = image_paths[start:start + args.batch_size]
+        with torch.no_grad():
+            image_embeddings = model.encode_image(batch_image_paths).cpu()
+            batch_similarity = image_embeddings @ audio_embeddings.T
+        similarities.append(batch_similarity.cpu())
 
-        similarity = torch.cat(similarities, dim=0).numpy()
+    similarity = torch.cat(similarities, dim=0).numpy()
     metrics = sparse_retrieval_metrics(
         similarity=similarity,
         relevance=relevance,
+        candidate_indices=candidate_indices,
         threshold=args.relevance_threshold,
         exponential_gain=True,
     )
@@ -219,12 +285,18 @@ def main() -> None:
         "num_relevance_labels": sum(len(row) for row in relevance),
         "clip_model": args.clip_model,
         "clap_model": args.clap_model,
-        "checkpoint": args.checkpoint,
+        "checkpoint": str(model.resolve_checkpoint_path(args.checkpoint))
+        if args.checkpoint is not None
+        else None,
         "metric_notes": {
             "ndcg": "Uses benchmark LLM scores as graded relevance.",
             "binary_metrics": (
                 "MRR, mAP, recall, and precision treat scores above "
                 f"{args.relevance_threshold} as relevant."
+            ),
+            "candidate_scope": (
+                "Metrics are computed only over audios scored for each image; "
+                "unevaluated audios are not treated as irrelevant."
             ),
         },
         "image_to_audio": metrics,

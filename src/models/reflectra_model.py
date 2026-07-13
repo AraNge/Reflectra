@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Literal, Optional
 
 import torch
@@ -10,6 +11,8 @@ from src.models.projection_head import MLPProjection, LinearProjection
 
 
 ProjectionType = Literal["mlp", "linear"]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 
 
 class ReflectraModel(nn.Module):
@@ -40,6 +43,7 @@ class ReflectraModel(nn.Module):
         freeze_clap: bool = True,
         normalize: bool = True,
         device: Optional[str] = None,
+        projection_checkpoint: str | Path | None = None,
     ):
         super().__init__()
 
@@ -78,6 +82,9 @@ class ReflectraModel(nn.Module):
             raise ValueError(f"Unsupported projection_type: {projection_type}")
 
         self.to(self.device)
+
+        if projection_checkpoint is not None:
+            self.load_projection_checkpoint(projection_checkpoint)
 
     @property
     def device(self) -> torch.device:
@@ -289,6 +296,32 @@ class ReflectraModel(nn.Module):
     def unfreeze_projection(self) -> None:
         for param in self.image_projection.parameters():
             param.requires_grad = True
+
+    def resolve_checkpoint_path(self, checkpoint_path: str | Path) -> Path:
+        path = Path(checkpoint_path).expanduser()
+        if path.exists():
+            return path.resolve()
+
+        candidate = CHECKPOINT_DIR / path
+        if candidate.exists():
+            return candidate.resolve()
+
+        return path
+
+    def load_projection_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        strict: bool = True,
+    ) -> None:
+        path = self.resolve_checkpoint_path(checkpoint_path)
+        checkpoint = torch.load(path, map_location=self.device)
+        load_result = self.image_projection.load_state_dict(
+            checkpoint["projection_state_dict"],
+            strict=strict,
+        )
+        if not strict:
+            print(f"Projection checkpoint load result: {load_result}")
+        print(f"Loaded projection checkpoint: {path}")
 
     def trainable_parameters(self):
         return [
