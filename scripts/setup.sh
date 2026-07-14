@@ -3,57 +3,56 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
+ACTION="${1:-start}"
+if [[ "$ACTION" == "--remove" ]]; then
+  ACTION="remove"
+fi
 
 echo "[INFO] Project root: $PROJECT_ROOT"
 
+if [[ "$ACTION" == "stop" || "$ACTION" == "remove" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[WARN] Docker is not installed or not available in PATH."
+  else
+    for container in reflectra-qdrant reflectra-jaeger; do
+      if docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        echo "[INFO] Stopping ${container}..."
+        docker stop "${container}" >/dev/null
+      elif docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+        echo "[INFO] ${container} already stopped."
+      else
+        echo "[INFO] ${container} does not exist."
+      fi
+
+      if [[ "$ACTION" == "remove" ]] && docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+        echo "[INFO] Removing ${container}..."
+        docker rm "${container}" >/dev/null
+      fi
+    done
+  fi
+
+  if [[ "$ACTION" == "remove" ]]; then
+    echo "[INFO] Removing Qdrant storage..."
+    rm -rf qdrant_storage
+    mkdir -p qdrant_storage
+    echo "[INFO] Reflectra containers and Qdrant data removed."
+    exit 0
+  fi
+
+  echo "[INFO] Reflectra services stopped."
+  exit 0
+fi
+
+if [[ "$ACTION" != "start" ]]; then
+  echo "Usage: scripts/setup.sh [start|stop|remove|--remove]"
+  exit 2
+fi
+
 mkdir -p \
-  configs \
   data/music \
-  data/audio/musiccaps \
-  data/audio/audioset \
-  data/audio/mtg_jamendo \
-  data/audio/song_describer \
-  data/images/coco_captions \
-  data/images/flickr30k \
-  data/images/emoset \
-  data/metadata \
-  data/embeddings/audio \
-  data/embeddings/image \
-  data/embeddings/text \
-  data/benchmark \
-  data/hf_cache \
-  results \
+  plots \
   qdrant_storage
 
-if [ ! -f "configs/reflectra.toml" ]; then
-  cat > configs/reflectra.toml <<'EOF'
-[models]
-clip = "openai/clip-vit-base-patch32"
-clap = "laion/clap-htsat-unfused"
-
-[qdrant]
-url = "http://localhost:6333"
-collection_name = "reflectra_music_clap"
-vector_size = 512
-
-[audio_index]
-music_dir = "data/music"
-batch_size = 8
-extensions = [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]
-
-[llm]
-base_url = ""
-api_key = ""
-api_key_env = "OPENAI_API_KEY"
-
-[benchmark]
-model = "gpt-4.1-mini"
-random_seed = 42
-output_dir = "data/benchmark"
-write_hf = true
-EOF
-  echo "[INFO] Created configs/reflectra.toml"
-fi
 
 if [ ! -d ".venv" ]; then
   echo "[INFO] Creating virtual environment..."
@@ -62,10 +61,7 @@ else
   echo "[INFO] Virtual environment already exists."
 fi
 
-# shellcheck disable=SC1091
 source .venv/bin/activate
-
-python -m pip install --upgrade pip setuptools wheel
 
 if grep -q "\[project.optional-dependencies\]" pyproject.toml; then
   echo "[INFO] Installing project in editable mode with dev extras..."
@@ -102,9 +98,37 @@ else
     qdrant/qdrant:latest
 fi
 
+echo "[INFO] Pulling Jaeger Docker image..."
+docker pull jaegertracing/all-in-one:1.21
+
+if docker ps -a --format '{{.Names}}' | grep -q '^reflectra-jaeger$'; then
+  if docker ps --format '{{.Names}}' | grep -q '^reflectra-jaeger$'; then
+    echo "[INFO] Jaeger container already running: reflectra-jaeger"
+  else
+    echo "[INFO] Starting existing Jaeger container..."
+    docker start reflectra-jaeger
+  fi
+else
+  echo "[INFO] Creating and starting Jaeger container..."
+  docker run -d \
+    --name reflectra-jaeger \
+    -p 16686:16686 \
+    -p 6831:6831/udp \
+    jaegertracing/all-in-one:1.21
+fi
+
 echo "[INFO] Waiting for Qdrant to become available..."
 for i in {1..30}; do
   if python - <<'PY'
+import os
+import importlib
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+_import_module = importlib.import_module
+def _protobuf_safe_import(name, package=None):
+    if name == "google._upb._message":
+        raise ImportError(name)
+    return _import_module(name, package)
+importlib.import_module = _protobuf_safe_import
 from qdrant_client import QdrantClient
 try:
     client = QdrantClient(url="http://localhost:6333")
@@ -117,6 +141,8 @@ PY
     echo "[INFO] Setup complete."
     echo "[INFO] Activate environment with: source .venv/bin/activate"
     echo "[INFO] Qdrant URL: http://localhost:6333"
+    echo "[INFO] Jaeger UI: http://127.0.0.1:16686"
+    echo "[INFO] Jaeger agent: localhost:6831"
     echo "[INFO] Put music files in: data/music"
     echo "[INFO] Index music with: python -m src.vector_db.index_clap_audio_qdrant --music-dir data/music"
     exit 0

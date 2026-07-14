@@ -1,12 +1,29 @@
+import os
 import uuid
+import importlib
 from typing import Any, Dict, List, Optional
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-)
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+_import_module = importlib.import_module
+
+
+def _protobuf_safe_import(name: str, package: str | None = None):
+    if name == "google._upb._message":
+        raise ImportError(name)
+    return _import_module(name, package)
+
+
+importlib.import_module = _protobuf_safe_import
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance,
+        VectorParams,
+        PointStruct,
+    )
+finally:
+    importlib.import_module = _import_module
 
 
 def get_qdrant_client(
@@ -57,10 +74,14 @@ def upsert_vectors(
     payloads: List[Dict[str, Any]],
     batch_size: int = 256,
 ) -> None:
-    assert len(ids) == len(vectors) == len(payloads)
+    if len(ids) != len(vectors) or len(ids) != len(payloads):
+        raise ValueError(
+            "ids, vectors, and payloads must have the same length: "
+            f"ids={len(ids)}, vectors={len(vectors)}, payloads={len(payloads)}"
+        )
 
     for start in range(0, len(ids), batch_size):
-        end = start + batch_size
+        end = min(start + batch_size, len(ids))
 
         points = [
             PointStruct(
@@ -88,6 +109,7 @@ def search_vector(
     collection_name: str,
     query_vector: List[float],
     limit: int = 10,
+    with_vectors: bool = False,
 ):
     """
     Uses query_points because newer Qdrant client versions prefer it.
@@ -98,6 +120,7 @@ def search_vector(
         query=query_vector,
         limit=limit,
         with_payload=True,
+        with_vectors=with_vectors,
     )
 
     return response.points

@@ -4,6 +4,8 @@ import io
 from pathlib import Path
 from typing import Any
 
+from src.utils.json import read_jsonl
+
 
 def as_list(value: Any) -> list[Any]:
     if value is None:
@@ -67,3 +69,49 @@ def image_suffix(image_bytes: bytes, fallback_path: str | None) -> str:
         pass
 
     return ".img"
+
+
+def load_unpacked_media_index(
+    path: Path,
+    id_column: str,
+    path_column: str,
+    dataset_dir: Path,
+    required_ids: set[str] | None = None,
+    project_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Load one of the unpacked benchmark index files written by
+    src.datasets.downloaders.download_reflectra_benchmark
+    (image_table.jsonl / audio_table.jsonl).
+
+    Each JSONL row looks like:
+        {"image_id": "...", "captions": [...], "image_path": "data/benchmark/images/xyz.jpg"}
+
+    Paths in the file are relative to the project root, but this also
+    tolerates already-absolute paths or paths relative to dataset_dir.
+    """
+
+    if project_root is None:
+        from src.datasets.paths import PROJECT_ROOT as project_root  # noqa: N813
+
+    records: dict[str, dict[str, Any]] = {}
+
+    for row in read_jsonl(path):
+        media_id = str(row[id_column])
+
+        if required_ids is not None and media_id not in required_ids:
+            continue
+
+        resolved_path = resolve_media_path(
+            str(row[path_column]),
+            project_root=project_root,
+            dataset_dir=dataset_dir,
+        )
+
+        records[media_id] = {
+            id_column: media_id,
+            "captions": as_list(row.get("captions")),
+            path_column: str(resolved_path),
+        }
+
+    return records

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from src.models.clip_encoder import PretrainedCLIPEncoder
 from src.models.clap_encoder import PretrainedCLAPEncoder
 from src.models.projection_head import MLPProjection, LinearProjection
+from src.models.reranker import RerankerType, build_reranker, rerank_topk_similarity
 
 
 ProjectionType = Literal["mlp", "linear"]
@@ -24,12 +25,17 @@ class ReflectraModel(nn.Module):
     - projection head: CLIP space -> CLAP space
     - CLAP text encoder
     - CLAP audio encoder
+    - (optional) cross-encoder reranker
 
     Main goal:
         image -> CLIP image embedding -> projection -> CLAP-compatible embedding
 
     Then the projected image embedding can be searched against
-    Qdrant audio embeddings produced by CLAP audio encoder.
+    Qdrant audio embeddings produced by CLAP audio encoder. If use_reranker
+    is enabled, the top candidates from that bi-encoder search are rescored
+    by a cross-encoder reranker before being returned — see
+    image_audio_similarity below and src/vector_db/rerank_search.py for the
+    Qdrant-backed version of the same pipeline.
     """
 
     def __init__(
@@ -44,6 +50,12 @@ class ReflectraModel(nn.Module):
         normalize: bool = True,
         device: Optional[str] = None,
         projection_checkpoint: str | Path | None = None,
+        use_reranker: bool = False,
+        reranker_type: RerankerType = "mlp",
+        reranker_hidden_dim: int = 512,
+        reranker_dropout: float = 0.1,
+        reranker_checkpoint: str | Path | None = None,
+        reranker_top_k: int = 20,
     ):
         super().__init__()
 
@@ -81,10 +93,32 @@ class ReflectraModel(nn.Module):
         else:
             raise ValueError(f"Unsupported projection_type: {projection_type}")
 
+        # --- Reranker (optional second stage) ---
+        self.use_reranker = use_reranker
+        self.reranker_top_k = reranker_top_k
+        self.reranker: Optional[nn.Module] = None
+
+        if use_reranker:
+            self.reranker = build_reranker(
+                reranker_type=reranker_type,
+                embed_dim=self.clap_dim,
+                hidden_dim=reranker_hidden_dim,
+                dropout=reranker_dropout,
+            )
+
         self.to(self.device)
 
         if projection_checkpoint is not None:
             self.load_projection_checkpoint(projection_checkpoint)
+
+        if use_reranker and reranker_checkpoint is not None:
+            self.load_reranker_checkpoint(reranker_checkpoint)
+        elif use_reranker and reranker_checkpoint is None:
+            print(
+                "[WARN] use_reranker=True but no reranker_checkpoint given — "
+                "the reranker is randomly initialized and will not improve ranking "
+                "until trained (see src.training.train_reranker)."
+            )
 
     @property
     def device(self) -> torch.device:
@@ -214,15 +248,44 @@ class ReflectraModel(nn.Module):
         self,
         image_paths: list[str],
         audio_paths: list[str],
+        use_reranker: Optional[bool] = None,
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Similarity between projected image embeddings and CLAP audio embeddings.
+
+        This is the main two-stage retrieval entrypoint:
+            1) bi-encoder similarity (CLIP-projected image vs CLAP audio)
+            2) if a reranker is enabled, the top_k candidates per image are
+               rescored by the cross-encoder reranker.
+
+        Args:
+            use_reranker:
+                Overrides self.use_reranker for this call. Pass False to force
+                plain bi-encoder scoring even if the model was built with a
+                reranker. Defaults to whatever the model was configured with.
+            top_k:
+                How many top bi-encoder candidates per image get rescored.
+                Defaults to self.reranker_top_k. Ignored if reranking is off.
         """
 
         image_embeds = self.encode_image(image_paths)
         audio_embeds = self.encode_audio(audio_paths, normalize=True)
 
-        return image_embeds @ audio_embeds.T
+        similarity = image_embeds @ audio_embeds.T
+
+        should_rerank = self.use_reranker if use_reranker is None else use_reranker
+
+        if should_rerank and self.reranker is not None:
+            similarity = rerank_topk_similarity(
+                similarity=similarity,
+                query_embeds=image_embeds,
+                candidate_embeds=audio_embeds,
+                reranker=self.reranker,
+                top_k=top_k or self.reranker_top_k,
+            )
+
+        return similarity
 
     def text_audio_similarity(
         self,
@@ -252,7 +315,7 @@ class ReflectraModel(nn.Module):
         - text_embeds
         - audio_embeds
         - image_text_logits
-        - image_audio_logits
+        - image_audio_logits (rerank-aware if use_reranker=True)
         - text_audio_logits
         """
 
@@ -273,9 +336,18 @@ class ReflectraModel(nn.Module):
             )
 
         if "image_embeds" in output and "audio_embeds" in output:
-            output["image_audio_logits"] = (
-                output["image_embeds"] @ output["audio_embeds"].T
-            )
+            image_audio_logits = output["image_embeds"] @ output["audio_embeds"].T
+
+            if self.use_reranker and self.reranker is not None:
+                image_audio_logits = rerank_topk_similarity(
+                    similarity=image_audio_logits,
+                    query_embeds=output["image_embeds"],
+                    candidate_embeds=output["audio_embeds"],
+                    reranker=self.reranker,
+                    top_k=self.reranker_top_k,
+                )
+
+            output["image_audio_logits"] = image_audio_logits
 
         if "text_embeds" in output and "audio_embeds" in output:
             output["text_audio_logits"] = (
@@ -322,6 +394,27 @@ class ReflectraModel(nn.Module):
         if not strict:
             print(f"Projection checkpoint load result: {load_result}")
         print(f"Loaded projection checkpoint: {path}")
+
+    def load_reranker_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        strict: bool = True,
+    ) -> None:
+        if self.reranker is None:
+            raise RuntimeError(
+                "Model was built with use_reranker=False — there is no reranker "
+                "to load weights into."
+            )
+
+        path = self.resolve_checkpoint_path(checkpoint_path)
+        checkpoint = torch.load(path, map_location=self.device)
+        load_result = self.reranker.load_state_dict(
+            checkpoint["reranker_state_dict"],
+            strict=strict,
+        )
+        if not strict:
+            print(f"Reranker checkpoint load result: {load_result}")
+        print(f"Loaded reranker checkpoint: {path}")
 
     def trainable_parameters(self):
         return [
