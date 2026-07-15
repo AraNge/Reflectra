@@ -10,19 +10,28 @@ from urllib import request
 
 from PySide6.QtCore import (
     QEasingCurve, QPropertyAnimation, QTimer, Qt, QThread,
-    Signal, QParallelAnimationGroup, QPoint, QRectF, QEvent
+    Signal, QParallelAnimationGroup, QPoint, QRectF, QEvent, QUrl
 )
 from PySide6.QtGui import (
     QColor, QIcon, QLinearGradient, QPainter, QPixmap,
     QRadialGradient, QBrush, QPen, QFont, QFontDatabase,
-    QPalette, QPainterPath
+    QPalette, QPainterPath, QDesktopServices
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGraphicsOpacityEffect,
     QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QStackedLayout, QVBoxLayout,
+    QPushButton, QProgressBar, QScrollArea, QStackedLayout, QVBoxLayout,
     QWidget, QSizePolicy
 )
+
+try:
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+except ImportError:  # pragma: no cover - depends on the local Qt install
+    QAudioOutput = None
+    QMediaPlayer = None
+
+
+MEDIA_STATUS_LOADED = getattr(QMediaPlayer.MediaStatus, "LoadedMedia", None) if QMediaPlayer is not None else None
 
 
 class SearchWorker(QThread):
@@ -68,6 +77,30 @@ class SearchWorker(QThread):
 
         with request.urlopen(req, timeout=600) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+class AudioDownloadWorker(QThread):
+    finished = Signal(int, str, bool)
+    failed = Signal(int, str)
+
+    def __init__(self, index: int, item: dict, output_dir: Path, play_after: bool) -> None:
+        super().__init__()
+        self.index = index
+        self.item = item
+        self.output_dir = output_dir
+        self.play_after = play_after
+
+    def run(self) -> None:
+        try:
+            from study.audio_parts import download_audio_from_metadata
+
+            audio_path = download_audio_from_metadata(
+                metadata=self.item,
+                output_dir=self.output_dir,
+            )
+            self.finished.emit(self.index, str(audio_path), self.play_after)
+        except Exception as exc:
+            self.failed.emit(self.index, str(exc))
 
 
 class StatusWorker(QThread):
@@ -277,21 +310,111 @@ class AnimatedBackground(QWidget):
         painter.drawEllipse(QRectF(center_x - radius * 0.88, base_top, radius * 1.76, radius * 0.44))
 
 
+class WaveformSeekBar(QWidget):
+    seek_requested = Signal(float)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.progress = 0.0
+        self.active = False
+        self.phase = 0.0
+        self.setMinimumHeight(40)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._animate)
+        self.amplitudes = [
+            0.35, 0.72, 0.5, 0.88, 0.42, 0.95, 0.65, 0.38,
+            0.8, 0.55, 0.92, 0.48, 0.7, 0.9, 0.45, 0.75,
+            0.58, 0.86, 0.52, 0.68, 0.96, 0.44, 0.74, 0.6,
+            0.84, 0.5, 0.78, 0.36, 0.66, 0.92, 0.54, 0.72,
+        ]
+
+    def set_progress(self, value: float) -> None:
+        self.progress = min(max(value, 0.0), 1.0)
+        self.update()
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+        if active and not self.timer.isActive():
+            self.timer.start(90)
+        elif not active:
+            self.timer.stop()
+            self.phase = 0.0
+        self.update()
+
+    def _animate(self) -> None:
+        self.phase = (self.phase + 0.16) % math.tau
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.button() != Qt.MouseButton.LeftButton or self.width() <= 0:
+            return
+        ratio = min(max(event.position().x() / self.width(), 0.0), 1.0)
+        self.set_progress(ratio)
+        self.seek_requested.emit(ratio)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        rect = self.rect().adjusted(0, 4, 0, -4)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        count = len(self.amplitudes)
+        gap = max(rect.width() / (count * 1.8), 3.0)
+        bar_width = max(gap * 0.45, 2.0)
+        step = rect.width() / count
+        center_y = rect.center().y()
+        played_x = rect.left() + rect.width() * self.progress
+
+        for index, amplitude in enumerate(self.amplitudes):
+            x = rect.left() + index * step + (step - bar_width) / 2
+            pulse = 0.0
+            if self.active:
+                pulse = 0.16 * math.sin(self.phase + index * 0.72)
+            height = rect.height() * min(max(amplitude + pulse, 0.22), 1.0)
+            y = center_y - height / 2
+
+            if x <= played_x:
+                color = QColor("#ffd45e")
+            elif self.active:
+                color = QColor("#54e2ca")
+                color.setAlpha(170)
+            else:
+                color = QColor(247, 244, 236, 150)
+
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(x, y, bar_width, height), bar_width / 2, bar_width / 2)
+
+
 class ModernResultCard(QFrame):
+    download_requested = Signal(int, dict, bool)
+    stop_requested = Signal(int)
+    seek_requested = Signal(int, dict, float)
+
     def __init__(self, item: dict, index: int) -> None:
         super().__init__()
         self.setObjectName("resultCard")
         self.index = index
-        self.setFixedHeight(120)
-        
-        # Setup opacity for fade-in
-        self.opacity_effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self.opacity_effect)
-        self.opacity_effect.setOpacity(0.0)
+        self.item = item
+        self.busy_step = 0
+        self.busy_play_after = False
+        self.busy_timer = QTimer(self)
+        self.busy_timer.timeout.connect(self._tick_busy)
+        self.setFixedHeight(214)
+        self.setStyleSheet("""
+            QFrame#resultCard {
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+                background: rgba(12, 18, 20, 0.72);
+            }
+        """)
         
         # Layout
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(16)
         
         # Left side - Number or icon
@@ -308,12 +431,17 @@ class ModernResultCard(QFrame):
         payload = item.get("payload") or {}
         captions = payload.get("captions") or []
         
-        # Title with source
-        title = QLabel(str(payload.get("source_dataset", "Unknown")))
+        title = QLabel(self._display_title(payload))
         title.setObjectName("cardTitle")
-        title.setStyleSheet("font-weight: 700; font-size: 16px; color: #f7f4ec;")
+        title.setStyleSheet("font-weight: 800; font-size: 17px; color: #f7f4ec;")
         title.setWordWrap(True)
         content_layout.addWidget(title)
+
+        source_label = QLabel(self._source_label(payload))
+        source_label.setObjectName("cardMeta")
+        source_label.setStyleSheet("color: #b8c0b4; font-size: 12px; font-weight: 650;")
+        source_label.setWordWrap(True)
+        content_layout.addWidget(source_label)
         
         # Metadata with visual indicators
         meta_layout = QHBoxLayout()
@@ -325,11 +453,10 @@ class ModernResultCard(QFrame):
         meta_layout.addWidget(score_bar)
         
         # Text metadata
-        meta_text = QLabel(
-            f"ID: {str(payload.get('dataset_id', payload.get('audio_id', 'unknown')))}"
-        )
+        meta_text = QLabel(f"dataset_id: {str(payload.get('dataset_id', 'unknown'))}")
         meta_text.setObjectName("cardMeta")
         meta_text.setStyleSheet("color: #b8c0b4; font-size: 12px;")
+        meta_text.setWordWrap(True)
         meta_layout.addWidget(meta_text)
         
         rerank = item.get('rerank_score')
@@ -343,16 +470,105 @@ class ModernResultCard(QFrame):
         content_layout.addLayout(meta_layout)
         
         # Captions
-        caption = QLabel(" ".join(str(text) for text in captions[:3]) or "No captions available")
+        caption = QLabel(" ".join(str(text) for text in captions[:2]) or "No captions available")
         caption.setObjectName("caption")
         caption.setStyleSheet("color: #e5e8df; font-size: 13px; line-height: 1.4;")
         caption.setWordWrap(True)
         content_layout.addWidget(caption)
+
+        self.waveform = WaveformSeekBar()
+        self.waveform.seek_requested.connect(lambda ratio: self.seek_requested.emit(self.index, self.item, ratio))
+        content_layout.addWidget(self.waveform)
         
         layout.addLayout(content_layout, 1)
-        
-        # Animate in
-        QTimer.singleShot(50 + index * 40, self._fade_in)
+
+        actions = QVBoxLayout()
+        actions.setSpacing(7)
+        self.play_button = QPushButton("Play")
+        self.play_button.setObjectName("resultActionPrimary")
+        self.play_button.setFixedSize(116, 34)
+        self.play_button.clicked.connect(lambda: self.download_requested.emit(self.index, self.item, True))
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("resultAction")
+        self.stop_button.setFixedSize(116, 34)
+        self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self.index))
+        self.download_button = QPushButton("Save")
+        self.download_button.setObjectName("resultAction")
+        self.download_button.setFixedSize(116, 34)
+        self.download_button.clicked.connect(lambda: self.download_requested.emit(self.index, self.item, False))
+        button_style = """
+            QPushButton {
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton#resultActionPrimary {
+                color: #1a1a1a;
+                background: #ffd45e;
+                border: none;
+            }
+            QPushButton#resultActionPrimary:hover {
+                background: #ffe06e;
+            }
+            QPushButton#resultAction {
+                color: #f7f4ec;
+                background: rgba(255, 255, 255, 0.13);
+                border: 1px solid rgba(255, 255, 255, 0.22);
+            }
+            QPushButton#resultAction:hover {
+                background: rgba(255, 255, 255, 0.2);
+            }
+            QPushButton:disabled {
+                color: rgba(247, 244, 236, 0.45);
+                background: rgba(255, 255, 255, 0.05);
+            }
+        """
+        self.play_button.setStyleSheet(button_style)
+        self.stop_button.setStyleSheet(button_style)
+        self.download_button.setStyleSheet(button_style)
+        self.download_progress = QProgressBar()
+        self.download_progress.setRange(0, 0)
+        self.download_progress.setTextVisible(False)
+        self.download_progress.setFixedSize(116, 6)
+        self.download_progress.hide()
+        self.download_progress.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                border-radius: 3px;
+                background: rgba(255, 255, 255, 0.08);
+            }
+            QProgressBar::chunk {
+                border-radius: 3px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #54e2ca, stop:0.5 #ffd45e, stop:1 #ff9a56);
+            }
+        """)
+        self.action_status = QLabel("")
+        self.action_status.setFixedWidth(116)
+        self.action_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.action_status.setStyleSheet("color: #b8c0b4; font-size: 11px;")
+        actions.addWidget(self.play_button)
+        actions.addWidget(self.stop_button)
+        actions.addWidget(self.download_button)
+        actions.addWidget(self.download_progress)
+        actions.addWidget(self.action_status)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+    def _display_title(self, payload: dict) -> str:
+        for key in ("filename", "stem", "dataset_id", "audio_id"):
+            value = str(payload.get(key, "")).strip()
+            if value:
+                return value
+        return "Unknown track"
+
+    def _source_label(self, payload: dict) -> str:
+        source = str(payload.get("source_dataset") or payload.get("source") or "unknown source")
+        audio_id = str(payload.get("audio_id") or "").strip()
+        if audio_id and audio_id != str(payload.get("dataset_id", "")).strip():
+            return f"{source} | audio_id: {audio_id}"
+        return source
     
     def _create_score_bar(self, score: float) -> QWidget:
         widget = QWidget()
@@ -375,13 +591,44 @@ class ModernResultCard(QFrame):
         
         return widget
     
-    def _fade_in(self) -> None:
-        self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity")
-        self.fade_animation.setDuration(400)
-        self.fade_animation.setStartValue(0.0)
-        self.fade_animation.setEndValue(1.0)
-        self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self.fade_animation.start()
+    def set_busy(self, busy: bool, play_after: bool = False) -> None:
+        self.play_button.setEnabled(not busy)
+        self.download_button.setEnabled(not busy)
+        self.busy_play_after = play_after
+        if busy:
+            self.busy_step = 0
+            self.download_progress.show()
+            self.action_status.setText("Fetching audio" if play_after else "Saving audio")
+            self._tick_busy()
+            self.busy_timer.start(260)
+        else:
+            self.busy_timer.stop()
+            self.download_progress.hide()
+            self.action_status.setText("")
+            self.play_button.setText("Play")
+            self.download_button.setText("Save")
+
+    def set_downloaded(self) -> None:
+        self.download_button.setText("Saved")
+        self.action_status.setText("Ready")
+
+    def set_playing(self, playing: bool) -> None:
+        self.waveform.set_active(playing)
+        self.play_button.setText("Playing" if playing else "Play")
+        self.action_status.setText("Playing" if playing else "")
+
+    def set_playback_progress(self, value: float) -> None:
+        self.waveform.set_progress(value)
+
+    def _tick_busy(self) -> None:
+        dots = "." * ((self.busy_step % 3) + 1)
+        self.busy_step += 1
+        if self.busy_play_after:
+            self.play_button.setText(f"Loading{dots}")
+            self.download_button.setText("Save")
+        else:
+            self.download_button.setText(f"Saving{dots}")
+            self.play_button.setText("Play")
 
 
 class ReflectraWindow(QMainWindow):
@@ -393,8 +640,21 @@ class ReflectraWindow(QMainWindow):
         self.selected_image: Path | None = None
         self.worker: SearchWorker | None = None
         self.status_worker: StatusWorker | None = None
+        self.audio_workers: dict[int, AudioDownloadWorker] = {}
+        self.result_cards: dict[int, ModernResultCard] = {}
+        self.downloaded_audio: dict[str, Path] = {}
+        self.audio_output_dir = Path("data/study_downloaded_audio")
+        self.media_player = None
+        self.audio_output = None
+        self.current_audio_index: int | None = None
+        self.pending_start_ratio = 0.0
+        self.pending_start_ratios: dict[str, float] = {}
+        self.canceled_audio_downloads: set[int] = set()
+        self.backend_status_failures = 0
+        self.backend_ready = False
         self._is_maximized = False
         self._drag_position: QPoint | None = None
+        self.title_bar: QWidget | None = None
         self.setAcceptDrops(True)
         
         # Window setup
@@ -428,31 +688,46 @@ class ReflectraWindow(QMainWindow):
         self.stack.addWidget(self.loading_page)
         self.stack.addWidget(self.main_page)
         self.stack.setCurrentWidget(self.loading_page)
-        
+
         # Setup animations
         self.setup_animations()
-        
+
         # Apply modern styles
         self.setStyleSheet(self.modern_stylesheet())
-        
+
         # Setup window controls
         self.setup_window_controls()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+    def setup_audio_player(self) -> bool:
+        if QMediaPlayer is None or QAudioOutput is None:
+            return False
+        if self.media_player is not None:
+            return True
+        self.media_player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(0.8)
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.positionChanged.connect(self.update_playback_position)
+        self.media_player.durationChanged.connect(self.update_playback_position)
+        if MEDIA_STATUS_LOADED is not None:
+            self.media_player.mediaStatusChanged.connect(self.apply_pending_start_position)
+        return True
     
     def setup_window_controls(self) -> None:
         # Title bar
-        title_bar = QWidget(self.main_page)
-        title_bar.setObjectName("titleBar")
-        title_bar.setFixedHeight(44)
-        title_bar.setStyleSheet("""
+        self.title_bar = QWidget(self.main_page)
+        self.title_bar.setObjectName("titleBar")
+        self.title_bar.setFixedHeight(44)
+        self.title_bar.setStyleSheet("""
             QWidget#titleBar {
                 background: transparent;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             }
         """)
-        title_bar_layout = QHBoxLayout(title_bar)
+        title_bar_layout = QHBoxLayout(self.title_bar)
         title_bar_layout.setContentsMargins(12, 0, 12, 0)
         
         # Title
@@ -492,7 +767,7 @@ class ReflectraWindow(QMainWindow):
         # Add title bar to main page
         main_layout = self.main_page.layout()
         if main_layout:
-            main_layout.insertWidget(0, title_bar)
+            main_layout.insertWidget(0, self.title_bar)
     
     def toggle_maximize(self) -> None:
         if self.isMaximized():
@@ -502,7 +777,7 @@ class ReflectraWindow(QMainWindow):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
         if event.button() == Qt.MouseButton.LeftButton and self._can_drag_from(event.position().toPoint()):
-            self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._begin_window_drag(event)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -523,10 +798,31 @@ class ReflectraWindow(QMainWindow):
     def _can_drag_from(self, position: QPoint) -> bool:
         child = self.childAt(position)
         while child is not None:
-            if isinstance(child, (QPushButton, QScrollArea)):
+            if isinstance(child, QPushButton):
                 return False
+            if child is self.title_bar:
+                return True
             child = child.parentWidget()
-        return True
+        return 0 <= position.y() <= 44
+
+    def _can_drag_widget(self, widget: QWidget) -> bool:
+        current: QWidget | None = widget
+        while current is not None:
+            if isinstance(current, QPushButton):
+                return False
+            if current is self.title_bar:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _begin_window_drag(self, event) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        handle = self.windowHandle()
+        if handle is not None and handle.startSystemMove():
+            self._drag_position = None
+            return
+        self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
         if not isinstance(watched, QWidget) or not self._contains_widget(watched):
@@ -535,8 +831,8 @@ class ReflectraWindow(QMainWindow):
         if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
                 position = watched.mapTo(self, event.position().toPoint())
-                if self._can_drag_from(position):
-                    self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                if self._can_drag_widget(watched) or self._can_drag_from(position):
+                    self._begin_window_drag(event)
                     return True
 
         if event.type() == QEvent.Type.MouseMove:
@@ -920,7 +1216,7 @@ class ReflectraWindow(QMainWindow):
         self.transition_group.addAnimation(self.slide_animation)
         self.transition_group.start()
         self.background.set_animation_enabled(True)
-        QTimer.singleShot(500, self.check_backend_status)
+        QTimer.singleShot(1800, self.check_backend_status)
 
     def check_backend_status(self) -> None:
         if self.status_worker is not None and self.status_worker.isRunning():
@@ -932,6 +1228,8 @@ class ReflectraWindow(QMainWindow):
         self.status_worker.start()
 
     def render_backend_status(self, payload: dict) -> None:
+        self.backend_status_failures = 0
+        self.backend_ready = bool(payload.get("ok", False))
         messages: list[str] = []
         qdrant = payload.get("qdrant") or {}
         jaeger = payload.get("jaeger") or {}
@@ -948,9 +1246,21 @@ class ReflectraWindow(QMainWindow):
             self.show_notification("ok", "Services are ready: Qdrant is online" + (" and Jaeger is visible." if jaeger.get("enabled") else "."))
 
     def show_backend_unreachable(self, message: str) -> None:
+        self.backend_status_failures += 1
+        if self.backend_ready:
+            QTimer.singleShot(5000, self.check_backend_status)
+            return
+        if self.backend_status_failures < 4:
+            self.status.setText("Backend is warming up...")
+            QTimer.singleShot(2000, self.check_backend_status)
+            return
         self.show_notification(
             "error",
-            f"Reflectra backend is still warming or unavailable. {message}",
+            (
+                f"Reflectra backend is not reachable at {self.backend_url}. "
+                "Start the app with reflectra-gui, or run reflectra-gui --server-only "
+                f"for this URL. {message}"
+            ),
         )
         QTimer.singleShot(3000, self.check_backend_status)
 
@@ -1029,6 +1339,8 @@ class ReflectraWindow(QMainWindow):
         self.worker.start()
     
     def render_results(self, payload: dict) -> None:
+        self.backend_ready = True
+        self.backend_status_failures = 0
         self.clear_results()
         results = payload.get("results", [])
         
@@ -1047,9 +1359,14 @@ class ReflectraWindow(QMainWindow):
             self.result_count.setText("No results")
         else:
             for i, item in enumerate(results):
+                card = ModernResultCard(item, i)
+                card.download_requested.connect(self.handle_audio_request)
+                card.stop_requested.connect(self.stop_audio)
+                card.seek_requested.connect(self.handle_audio_seek)
+                self.result_cards[i] = card
                 self.results_layout.insertWidget(
                     self.results_layout.count() - 1,
-                    ModernResultCard(item, i)
+                    card
                 )
             self.result_count.setText(f"{len(results)} results")
         
@@ -1083,10 +1400,151 @@ class ReflectraWindow(QMainWindow):
         QMessageBox.critical(self, "Reflectra", f"Search failed: {message}")
     
     def clear_results(self) -> None:
+        self.result_cards.clear()
         while self.results_layout.count() > 0:
             item = self.results_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.results_layout.addStretch()
+
+    def audio_cache_key(self, item: dict) -> str:
+        payload = item.get("payload") or item
+        if not isinstance(payload, dict):
+            return str(id(item))
+        return "|".join(
+            [
+                str(payload.get("source_dataset", "")),
+                str(payload.get("dataset_id", "")),
+                str(payload.get("audio_id", "")),
+            ]
+        )
+
+    def handle_audio_request(self, index: int, item: dict, play_after: bool) -> None:
+        key = self.audio_cache_key(item)
+        cached_path = self.downloaded_audio.get(key)
+        if cached_path is not None and cached_path.exists():
+            if play_after:
+                self.play_audio(cached_path, index=index)
+            else:
+                self.show_notification("ok", f"Audio already saved: {cached_path}")
+            return
+
+        if index in self.audio_workers and self.audio_workers[index].isRunning():
+            self.show_notification("warning", "Audio is already downloading for this result.")
+            return
+
+        card = self.result_cards.get(index)
+        if card is not None:
+            card.set_busy(True, play_after=play_after)
+
+        self.status.setText("Downloading audio from the source dataset...")
+        self.canceled_audio_downloads.discard(index)
+        worker = AudioDownloadWorker(index, item, self.audio_output_dir, play_after)
+        worker.finished.connect(lambda done_index, path, should_play, key=key: self.audio_download_finished(done_index, path, should_play, key))
+        worker.failed.connect(self.audio_download_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self.audio_workers[index] = worker
+        worker.start()
+
+    def audio_download_finished(self, index: int, path: str, play_after: bool, key: str) -> None:
+        audio_path = Path(path)
+        self.downloaded_audio[key] = audio_path
+        start_ratio = self.pending_start_ratios.pop(key, 0.0)
+        self.audio_workers.pop(index, None)
+        canceled = index in self.canceled_audio_downloads
+        self.canceled_audio_downloads.discard(index)
+        card = self.result_cards.get(index)
+        if card is not None:
+            card.set_busy(False)
+            card.set_downloaded()
+            if canceled:
+                card.set_playing(False)
+        self.status.setText(f"Audio saved: {audio_path.name}")
+        self.show_notification("ok", f"Audio saved to {audio_path}")
+        if play_after and not canceled:
+            self.play_audio(audio_path, index=index, start_ratio=start_ratio)
+
+    def audio_download_failed(self, index: int, message: str) -> None:
+        self.audio_workers.pop(index, None)
+        card = self.result_cards.get(index)
+        if card is not None:
+            card.set_busy(False)
+        self.status.setText("Audio download failed")
+        self.show_notification("error", f"Audio download failed. {message}")
+
+    def handle_audio_seek(self, index: int, item: dict, ratio: float) -> None:
+        key = self.audio_cache_key(item)
+        cached_path = self.downloaded_audio.get(key)
+        if cached_path is not None and cached_path.exists():
+            self.play_audio(cached_path, index=index, start_ratio=ratio)
+            return
+
+        self.pending_start_ratios[key] = ratio
+        self.handle_audio_request(index, item, True)
+
+    def play_audio(self, path: Path, index: int | None = None, start_ratio: float = 0.0) -> None:
+        self.stop_current_card_animation()
+        if self.setup_audio_player() and self.media_player is not None:
+            self.current_audio_index = index
+            self.pending_start_ratio = min(max(start_ratio, 0.0), 1.0)
+            self.media_player.setSource(QUrl.fromLocalFile(str(path.resolve())))
+            self.apply_pending_start_position()
+            self.media_player.play()
+            if index is not None and index in self.result_cards:
+                self.result_cards[index].set_playing(True)
+            self.status.setText(f"Playing: {path.name}")
+            return
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        self.status.setText(f"Opened audio: {path.name}")
+
+    def stop_audio(self, index: int | None = None) -> None:
+        if index is not None and index in self.audio_workers:
+            self.canceled_audio_downloads.add(index)
+            card = self.result_cards.get(index)
+            if card is not None:
+                self.pending_start_ratios.pop(self.audio_cache_key(card.item), None)
+            if card is not None:
+                card.set_busy(False)
+                card.set_playing(False)
+            self.status.setText("Playback start canceled")
+            return
+
+        if self.media_player is not None:
+            self.media_player.stop()
+        target_index = self.current_audio_index if index is None else index
+        if target_index is not None and target_index in self.result_cards:
+            self.result_cards[target_index].set_playing(False)
+        if index is None or index == self.current_audio_index:
+            self.current_audio_index = None
+        self.status.setText("Playback stopped")
+
+    def stop_current_card_animation(self) -> None:
+        if self.current_audio_index is not None and self.current_audio_index in self.result_cards:
+            self.result_cards[self.current_audio_index].set_playing(False)
+
+    def apply_pending_start_position(self, status=None) -> None:
+        if self.media_player is None or self.pending_start_ratio <= 0:
+            return
+        if status is not None and MEDIA_STATUS_LOADED is not None and status != MEDIA_STATUS_LOADED:
+            return
+        duration = int(self.media_player.duration() or 0)
+        if duration <= 0:
+            return
+        self.media_player.setPosition(int(duration * self.pending_start_ratio))
+        self.pending_start_ratio = 0.0
+
+    def update_playback_position(self, _value: int | None = None) -> None:
+        if self.media_player is None or self.current_audio_index is None:
+            return
+        duration = int(self.media_player.duration() or 0)
+        if duration <= 0:
+            return
+        position = int(self.media_player.position() or 0)
+        card = self.result_cards.get(self.current_audio_index)
+        if card is not None:
+            card.set_playback_progress(position / duration)
     
     def on_scroll(self, value: int) -> None:
         if hasattr(self, 'background'):
@@ -1110,6 +1568,10 @@ class ReflectraWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait()
+        for worker in list(self.audio_workers.values()):
+            if worker.isRunning():
+                worker.quit()
+                worker.wait()
         event.accept()
     
     def keyPressEvent(self, event) -> None:

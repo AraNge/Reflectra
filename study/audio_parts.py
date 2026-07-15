@@ -47,6 +47,10 @@ class AudioRecord:
     dataset_id: str
     source_dataset: str
     captions: list[str]
+    dataset_key: str | None = None
+    dataset_split: str | None = None
+    dataset_subset: str | None = None
+    archive_idx: int | None = None
 
 
 @dataclass
@@ -148,6 +152,8 @@ def iter_song_describer_part(
                         dataset_id=dataset_id,
                         source_dataset="renumics/song-describer-dataset",
                         captions=normalize_captions(row.get("caption")),
+                        dataset_key="song_describer",
+                        dataset_split=split,
                     ),
                 )
             )
@@ -250,6 +256,9 @@ def iter_mtg_jamendo_part(
                             instruments=track["instruments"],
                             moods=track["moods"],
                         ),
+                        dataset_key=f"mtg_jamendo_{split}",
+                        dataset_split=split,
+                        archive_idx=archive_idx,
                     ),
                 )
             )
@@ -323,6 +332,9 @@ def iter_audioset_part(
                         dataset_id=dataset_id,
                         source_dataset="agkphysics/AudioSet",
                         captions=make_captions_from_labels(human_labels),
+                        dataset_key=f"audioset_{subset}_{split}",
+                        dataset_split=split,
+                        dataset_subset=subset,
                     ),
                 )
             )
@@ -378,6 +390,10 @@ def download_part(
 def download_song_describer_by_dataset_id(dataset_id: str, output_dir: Path) -> Path:
     split = "train"
     row_index = int(dataset_id)
+    audio_path = output_dir / f"{safe_song_describer_filename(f'song_describer_{dataset_id}')}.wav"
+    if audio_path.exists():
+        return audio_path
+
     ds = load_dataset(
         "renumics/song-describer-dataset",
         split=split,
@@ -390,24 +406,67 @@ def download_song_describer_by_dataset_id(dataset_id: str, output_dir: Path) -> 
     if audio is None:
         raise RuntimeError(f"No Song Describer audio found for dataset_id={dataset_id}")
 
-    audio_path = output_dir / f"{safe_song_describer_filename(f'song_describer_{dataset_id}')}.wav"
     if not save_song_describer_audio(audio, str(audio_path)):
         raise RuntimeError(f"Failed to save Song Describer audio for dataset_id={dataset_id}")
 
     return audio_path
 
 
-def download_mtg_jamendo_by_dataset_id(dataset_id: str, output_dir: Path) -> Path:
+def extract_mtg_track_from_archive(
+    archive_path: str,
+    track_id: int,
+    extract_dir: Path,
+) -> Path | None:
+    target_stem = str(track_id)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(archive_path, "r") as archive:
+        for member in archive.getmembers():
+            member_path = Path(member.name)
+            if member_path.suffix != ".opus" or member_path.stem != target_stem:
+                continue
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise RuntimeError(f"Unsafe MTG-Jamendo archive member: {member.name}")
+            archive.extract(member, extract_dir)
+            return extract_dir / member.name
+
+    return None
+
+
+def download_mtg_jamendo_by_dataset_id(
+    dataset_id: str,
+    output_dir: Path,
+    split_hint: str | None = None,
+    archive_hint: int | None = None,
+) -> Path:
     track_id = int(dataset_id)
     audio_path = output_dir / f"{safe_mtg_filename(f'mtg_jamendo_{dataset_id}')}.wav"
+    if audio_path.exists():
+        return audio_path
 
-    for split in ("train", "validation"):
-        for _, source_path in iter_mtg_audio_paths(
-            split=split,
-            part_dir=output_dir / "_mtg_lookup",
-            start_archive=0,
-        ):
-            if source_path.stem != str(track_id):
+    splits = [split_hint] if split_hint in {"train", "validation"} else ["train", "validation"]
+
+    for split in splits:
+        split_config = SPLIT_FILES[split]
+        archive_dir = split_config["archive_dir"]
+        archive_indexes = (
+            [archive_hint]
+            if archive_hint is not None
+            else range(split_config["num_archives"])
+        )
+
+        for archive_idx in archive_indexes:
+            if archive_idx is None:
+                continue
+            archive_filename = f"data/{archive_dir}/{int(archive_idx)}.tar"
+            archive_path = download_mtg_repo_file(archive_filename)
+            lookup_dir = output_dir / "_mtg_lookup" / split / str(archive_idx)
+            source_path = extract_mtg_track_from_archive(
+                archive_path=archive_path,
+                track_id=track_id,
+                extract_dir=lookup_dir,
+            )
+            if source_path is None:
                 continue
 
             if not save_mtg_audio_file(str(source_path), str(audio_path)):
@@ -420,15 +479,28 @@ def download_mtg_jamendo_by_dataset_id(dataset_id: str, output_dir: Path) -> Pat
     raise RuntimeError(f"MTG-Jamendo track not found for dataset_id={dataset_id}")
 
 
-def download_audioset_by_dataset_id(dataset_id: str, output_dir: Path) -> Path:
+def download_audioset_by_dataset_id(
+    dataset_id: str,
+    output_dir: Path,
+    subset_hint: str | None = None,
+    split_hint: str | None = None,
+) -> Path:
     audio_path = output_dir / f"{safe_audioset_filename(dataset_id)}.wav"
+    if audio_path.exists():
+        return audio_path
 
-    for subset, split in (
-        ("balanced", "train"),
-        ("balanced", "test"),
-        ("unbalanced", "train"),
-        ("unbalanced", "test"),
-    ):
+    candidates = (
+        [(subset_hint, split_hint)]
+        if subset_hint in {"balanced", "unbalanced"} and split_hint in {"train", "test"}
+        else [
+            ("balanced", "train"),
+            ("balanced", "test"),
+            ("unbalanced", "train"),
+            ("unbalanced", "test"),
+        ]
+    )
+
+    for subset, split in candidates:
         ds = load_dataset(
             "agkphysics/AudioSet",
             subset,
@@ -458,6 +530,12 @@ def download_audio_from_metadata(
     payload = metadata.get("payload", metadata)
     source_dataset = str(payload.get("source_dataset", ""))
     dataset_id = str(payload.get("dataset_id", ""))
+    dataset_split = payload.get("dataset_split")
+    dataset_subset = payload.get("dataset_subset")
+    archive_idx = payload.get("archive_idx")
+    parsed_archive_idx: int | None = None
+    if archive_idx not in (None, ""):
+        parsed_archive_idx = int(archive_idx)
 
     if not source_dataset or not dataset_id:
         raise ValueError("Metadata must contain source_dataset and dataset_id.")
@@ -466,9 +544,19 @@ def download_audio_from_metadata(
         return download_song_describer_by_dataset_id(dataset_id, output_dir)
 
     if source_dataset == "rkstgr/mtg-jamendo":
-        return download_mtg_jamendo_by_dataset_id(dataset_id, output_dir)
+        return download_mtg_jamendo_by_dataset_id(
+            dataset_id,
+            output_dir,
+            split_hint=str(dataset_split) if dataset_split is not None else None,
+            archive_hint=parsed_archive_idx,
+        )
 
     if source_dataset == "agkphysics/AudioSet":
-        return download_audioset_by_dataset_id(dataset_id, output_dir)
+        return download_audioset_by_dataset_id(
+            dataset_id,
+            output_dir,
+            subset_hint=str(dataset_subset) if dataset_subset is not None else None,
+            split_hint=str(dataset_split) if dataset_split is not None else None,
+        )
 
     raise ValueError(f"Unsupported source_dataset: {source_dataset}")

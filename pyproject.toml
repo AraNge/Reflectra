@@ -12,6 +12,7 @@ dependencies = [
     "transformers",
     "qdrant-client",
     "numpy",
+    "matplotlib",
     "librosa",
     "soundfile",
     "pillow",

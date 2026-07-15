@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import subprocess
+import sys
 import tempfile
-import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +21,16 @@ JAEGER_AGENT_HOST = "localhost"
 JAEGER_AGENT_PORT = 6831
 JAEGER_UI_HOST = "127.0.0.1"
 JAEGER_UI_PORT = 16686
+
+
+def save_timing_plot_safely(timer: Any, output_path: str | Path, show: bool) -> str | None:
+    try:
+        timer.save_plot(output_path, show=show)
+        return None
+    except Exception as exc:
+        message = f"Could not save timing plot to {output_path}: {exc}"
+        print(f"[WARN] {message}", file=sys.stderr)
+        return message
 
 
 def add_search_args(parser: argparse.ArgumentParser, config: dict[str, Any]) -> None:
@@ -152,6 +163,7 @@ def search_image(
     configure_tracing(args)
     client = get_qdrant_client(url=args.qdrant_url)
     model = model or load_model(args)
+    warnings: list[str] = []
 
     if args.use_reranker:
         from src.vector_db.rerank_search import search_image_with_rerank
@@ -174,48 +186,63 @@ def search_image(
         )
         results = search_result["results"]
         timings = search_result["timings"]
+        warnings.extend(search_result.get("warnings", []))
     else:
         import torch
 
         from src.opentelemetry.telemetry import StageTimer
 
         timer = StageTimer("image_search")
-        with timer.stage("encode_query"):
-            with torch.no_grad():
-                query_embed = model.encode_image([image_path])[0]
+        with timer.trace():
+            with timer.stage("encode_query"):
+                with torch.no_grad():
+                    query_embed = model.encode_image([image_path])[0]
 
-        with timer.stage("check_db"):
-            candidates = search_vector(
-                client=client,
-                collection_name=args.collection_name,
-                query_vector=query_embed.cpu().numpy().tolist(),
-                limit=args.final_k,
-            )
+            with timer.stage("check_db"):
+                candidates = search_vector(
+                    client=client,
+                    collection_name=args.collection_name,
+                    query_vector=query_embed.cpu().numpy().tolist(),
+                    limit=args.final_k,
+                )
 
-        with timer.stage("format_results"):
-            results = [
-                {
-                    "payload": point.payload,
-                    "bi_encoder_score": float(point.score),
-                    "rerank_score": None,
-                }
-                for point in candidates
-            ]
+            with timer.stage("format_results"):
+                results = [
+                    {
+                        "payload": point.payload,
+                        "bi_encoder_score": float(point.score),
+                        "rerank_score": None,
+                    }
+                    for point in candidates
+                ]
 
         if args.timing_json:
             timer.save_json(args.timing_json)
         timing_plot_path = resolve_timing_plot_path(args.timing_plot, args.timing_dir, "image_search")
         if timing_plot_path is not None:
-            timer.save_plot(timing_plot_path, show=args.show_timing_plot)
+            warning = save_timing_plot_safely(
+                timer,
+                timing_plot_path,
+                show=args.show_timing_plot,
+            )
+            if warning is not None:
+                warnings.append(warning)
         timings = timer.as_dicts()
 
-    return {
+    response = {
         "image": image_path,
         "collection_name": args.collection_name,
         "reranker_used": bool(args.use_reranker),
         "results": results,
         "timings": timings,
     }
+    if warnings:
+        response["warnings"] = warnings
+    if getattr(args, "jaeger", False):
+        from src.opentelemetry.telemetry import force_flush_traces
+
+        force_flush_traces()
+    return response
 
 
 def resolve_timing_plot_path(
@@ -367,6 +394,8 @@ class ReflectraRequestHandler(BaseHTTPRequestHandler):
             )
             self.send_json(200, result)
         except Exception as exc:
+            print("[ERROR] Reflectra search request failed:", file=sys.stderr)
+            traceback.print_exc()
             self.send_json(500, {"error": str(exc)})
 
 
@@ -400,24 +429,14 @@ def gui_main() -> None:
 
     from src.gui.app import run_app
 
-    server_state: dict[str, Any] = {
-        "server": None,
-        "error": None,
-    }
-
-    def backend_worker() -> None:
-        try:
-            server = build_server(args)
-            server_state["server"] = server
-            print(f"[INFO] Reflectra backend ready: http://{args.host}:{args.port}")
-            server.serve_forever()
-        except Exception as exc:
-            server_state["error"] = exc
-            print("[ERROR] Reflectra backend failed to start:")
-            traceback.print_exc()
-
-    thread = threading.Thread(target=backend_worker, daemon=True)
-    thread.start()
+    backend_command = [
+        sys.executable,
+        "-c",
+        "from src.main import gui_main; gui_main()",
+        *sys.argv[1:],
+        "--server-only",
+    ]
+    backend_process = subprocess.Popen(backend_command)
     print(f"[INFO] Reflectra GUI opened; backend warming at http://{args.host}:{args.port}")
 
     try:
@@ -428,9 +447,12 @@ def gui_main() -> None:
             )
         )
     finally:
-        server = server_state.get("server")
-        if server is not None:
-            server.shutdown()
+        backend_process.terminate()
+        try:
+            backend_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            backend_process.kill()
+            backend_process.wait()
 
 
 def main() -> None:

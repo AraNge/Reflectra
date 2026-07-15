@@ -15,474 +15,361 @@
   <img src="https://img.shields.io/badge/Model-CLIP%20%2B%20CLAP-00BFFF" />
   <img src="https://img.shields.io/badge/Vector%20DB-Qdrant-FF4FD8" />
   <img src="https://img.shields.io/badge/Framework-PyTorch-EE4C2C" />
+  <img src="https://img.shields.io/badge/Telemetry-OpenTelemetry-7B61FF" />
 </p>
 
 </div>
 
+## Architecture
 
----
+<p align="center">
+  <img src="assets/architecture.png" alt="Reflectra architecture" width="900"/>
+</p>
 
-## Overview
+## Install
 
-Reflectra is a multimodal retrieval system for recommending songs from an input image. The project does not generate music. Instead, it maps images, text descriptions, and audio clips into compatible embedding spaces and retrieves the closest matching audio tracks.
+Requirements:
 
-The system flow is:
+- Python 3.10+
+- Docker, for local Qdrant
+- Enough disk space for Qdrant storage, model caches, and downloaded audio clips
 
-```text
-image
-↓
-CLIP image encoder
-↓
-image-to-CLAP projection layer
-↓
-CLAP embedding space
-↓
-Qdrant vector search over CLAP audio embeddings
-↓
-candidate songs
-↓
-reranker
-↓
-ranked songs
-```
-
-
----
-
-## Datasets
-
-Downloaded files should live in the top-level `data/` directory. Python code for loading and downloading datasets should live under `src/datasets/`.
-
-### Audio-text datasets
-
-| Dataset | Main use | Notes |
-|---|---|---|
-| MusicCaps | Clean text-to-audio evaluation | Stores the human caption plus aspect-list entries as `captions`. Best clean benchmark for CLAP retrieval. |
-| Song Describer Dataset | Clean text-to-audio evaluation | Stores available song descriptions as `captions`. |
-| MTG-Jamendo | Training / validation / scale evaluation | Builds captions from moods, genres, and instruments, then saves only the clean caption list. |
-| AudioSet | Large-scale weak evaluation / robustness | Builds one caption per human label. Useful for scale and hard negatives, but not a clean song-caption benchmark. |
-
-### Image-text datasets
-
-| Dataset | Main use | Notes |
-|---|---|---|
-| COCO 2014 | Image-text benchmark | General image-caption alignment using Karpathy caption metadata. |
-| Flickr30k | Clean image-text evaluation | Copies the dataset caption list into `captions`. |
-| EmoSet | Image mood alignment | Converts visual emotion into music-oriented captions. |
-
-All normal metadata JSONL rows use a small generic schema:
-
-```json
-{
-  "audio_id": "...",
-  "audio_path": "...",
-  "captions": ["..."],
-  "split": "...",
-  "source_dataset": "..."
-}
-```
-
-For image datasets, `audio_id/audio_path` are replaced by `image_id/image_path`. Metadata loaders keep captions grouped on each media item; torch datasets combine the `captions` list into one training text when reading a sample.
-
----
-
-## Installation
-
-This project uses `pyproject.toml`, so install it as a package from the project root.
-
-### 1. Create environment
+From the project root:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 2. Install package
-
-
-```bash
 pip install -e .
 ```
 
-
-### 3. Run setup script
+Or let the setup script create the environment, install the package, and start services:
 
 ```bash
 bash scripts/setup.sh
 ```
 
-The setup script creates project directories, writes `configs/reflectra.toml` if missing, installs the package in editable mode, pulls the Qdrant Docker image, and starts a local Qdrant container.
+Useful service commands:
 
----
+```bash
+bash scripts/setup.sh start
+bash scripts/setup.sh stop
+bash scripts/setup.sh remove
+```
 
-## Qdrant Setup
+`remove` deletes the local `qdrant_storage` directory, so use it only when you really want a clean vector DB.
 
-Qdrant is used to store CLAP audio embeddings and perform fast approximate nearest-neighbor search.
+## Configure
 
-Default local URL:
+Defaults live in [configs/reflectra.toml](configs/reflectra.toml):
+
+```toml
+[qdrant]
+url = "http://localhost:6333"
+collection_name = "reflectra_music_clap"
+vector_size = 512
+
+[models]
+clip = "openai/clip-vit-base-patch32"
+clap = "laion/clap-htsat-unfused"
+```
+
+The bundled projection checkpoint is in [checkpoints/](checkpoints/).
+
+## Use The App
+
+Start Qdrant first:
+
+```bash
+bash scripts/setup.sh start
+```
+
+Start the backend plus GUI:
+
+```bash
+reflectra-gui --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt
+```
+
+The GUI lets you choose or drop an image, run search, then `Play` or `Save` a returned track. For study-indexed dataset tracks, playback downloads the source audio using metadata stored in Qdrant payloads:
+
+- `source_dataset`
+- `dataset_id`
+- `audio_id`
+- `captions`
+
+Downloaded clips are saved under:
 
 ```text
-http://localhost:6333
+data/study_downloaded_audio/
 ```
 
-Start Qdrant manually:
+Command-line image search is also available:
 
 ```bash
-docker run -d \
-  --name reflectra-qdrant \
-  -p 6333:6333 \
-  -p 6334:6334 \
-  -v "$(pwd)/qdrant_storage:/qdrant/storage" \
-  qdrant/qdrant:latest
+reflectra-search path/to/image.jpg \
+  --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt \
+  --output result.json
 ```
 
-Stop Qdrant:
+## Observability
+
+
+Reflectra can trace search stages as OpenTelemetry spans, export them to a local Jaeger UI,
+and save per-stage timing JSON/PNG plots for quick performance checks.
+
+
+`scripts/setup.sh` starts a local Jaeger container together with Qdrant:
 
 ```bash
-docker stop reflectra-qdrant
+bash scripts/setup.sh start
 ```
 
-Start an existing Qdrant container again:
+Check Jaeger in the browser:
+
+```text
+http://127.0.0.1:16686
+```
+
+Jaeger shows trace spans, not PNG plots. In the Jaeger UI, select the `reflectra` service, set the lookback window, then click `Find Traces`. A successful search request appears as `image_search` or `image_search_with_rerank`, with child spans such as `encode_query`, `check_db`, and `format_results`.
+
+Run CLI search with tracing and timing outputs:
 
 ```bash
-docker start reflectra-qdrant
+reflectra-search path/to/image.jpg \
+  --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt \
+  --jaeger \
+  --timing-json plots/image_search.json \
+  --timing-plot plots/image_search.png \
+  --output result.json
 ```
 
----
-
-## Scripts
-
-The `scripts/` folder contains runnable shortcuts for common workflows:
+Run the GUI/backend with Jaeger enabled:
 
 ```bash
-bash scripts/setup.sh
+reflectra-gui \
+  --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt \
+  --jaeger
 ```
 
-Creates local data/config folders, installs the project in editable mode, and starts Qdrant with Docker when available.
+Useful paths and services:
+
+```text
+Jaeger UI:       http://127.0.0.1:16686
+Jaeger agent:    localhost:6831/udp
+Timing plots:    plots/*.png
+Timing JSON:     plots/*.json, or any path passed to --timing-json
+Service name:    reflectra, override with --otel-service-name
+```
+
+If `--timing-plot` is passed without a path, Reflectra writes to:
+
+```text
+plots/image_search.png
+plots/image_search_with_rerank.png
+```
+
+## Vector DB
+
+For the large study vector DB, use the scripts and notes in [study/README.md](study/README.md).
+
+Quick path:
 
 ```bash
-bash scripts/generate_clap_dataset.sh --audio-samples 100 --max-audios 6
+bash study/fill_db.sh --target-samples 500000 --part-size 200
 ```
 
-Builds or resumes the CLAP caption-to-audio LLM benchmark using Song Describer metadata and a local `llama-server`.
+Create a portable snapshot:
 
 ```bash
-bash scripts/generate_dataset.sh --max-samples 6
+python -m study.snapshot_vector_db create
 ```
 
-Builds or resumes the image-to-audio Reflectra benchmark from Flickr30k images and Song Describer audio. Use `-s INDEX` for sharded runs.
+Restore a snapshot:
 
 ```bash
-bash scripts/train_proj.sh -n 1000
+python -m study.snapshot_vector_db restore data/vector_db/<snapshot>.tar.gz --force
 ```
 
-Trains the image-to-CLAP projection on a sampled Flickr30k metadata subset.
+## Benchmarks And Evaluation
+
+Reflectra has two main retrieval evaluations:
+
+- `Reflectra`: image-to-audio retrieval for the full system.
+- `CLAP`: text-to-audio retrieval for the audio encoder baseline.
+
+Both evaluation scripts download/unpack the prepared benchmark data before running metrics.
+
+### Benchmarks Used
+
+| Benchmark | Link | Size / structure | Used for |
+|---|---:|---:|---|
+| Reflectra image-to-audio benchmark | [Hugging Face](https://huggingface.co/datasets/AraNge/reflectra-benchmark) | Project benchmark generated from sampled Flickr30k image metadata and Song Describer audio metadata. The default generation script uses 1,000 images, 1,000 audios, and up to 6 candidate audios per image, producing up to 6,000 scored image-audio pairs. | Full image-to-audio Reflectra evaluation. |
+| Reflectra CLAP benchmark | [Hugging Face](https://huggingface.co/datasets/AraNge/reflectra-clap-benchmark) | Project benchmark generated from Song Describer audio captions. The default generation script uses 100 audio samples and up to 6 candidate audios per caption query. | CLAP text-to-audio baseline evaluation. |
+| CxC SITS labels | [GitHub](https://github.com/google-research-datasets/Crisscrossed-Captions) | CxC contains 247,315 human-labeled annotations over image-image, caption-caption, and image-caption pairs from MS-COCO Karpathy dev/test splits. | Optional CLIP image-caption evaluation. |
+
+### Evaluate Reflectra
+
+Run the full image-to-audio evaluation:
 
 ```bash
-bash scripts/evaluate_reflectra.sh --checkpoint checkpoints/reflectra.pt
+bash scripts/evaluate_reflectra.sh --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt
 ```
 
-Downloads and unpacks the Reflectra benchmark dataset, then runs Reflectra evaluation. Omit `--checkpoint` to use the first projection checkpoint found in `checkpoints/`.
+Output:
+
+```text
+evaluation_results/reflectra_eval_results.json
+```
+
+This evaluates image queries against candidate audio tracks. Relevance comes from the Reflectra benchmark scores. The evaluator reports:
+
+- `ndcg@1`, `ndcg@5`, `ndcg@max-audios`
+- `mrr`
+- `mAP`
+- `recall@1`, `recall@5`, `recall@max-audios`
+- `precision@1`, `precision@5`, `precision@max-audios`
+
+NDCG uses graded benchmark relevance. MRR, mAP, recall, and precision treat scores above the relevance threshold as relevant.
+
+### Evaluate CLAP
+
+Run the CLAP text-to-audio baseline:
 
 ```bash
 bash scripts/evaluate_clap.sh
 ```
 
-Downloads and unpacks the CLAP benchmark dataset, then runs only the CLAP caption-to-audio evaluation.
-
----
-
-## Download Data
-
-Examples:
-
-```bash
-python -m src.datasets.downloaders.download_musiccaps --number 100
-python -m src.datasets.downloaders.download_audioset --number 100
-python -m src.datasets.downloaders.download_mtg_jamendo --split train --number 100
-python -m src.datasets.downloaders.download_mtg_jamendo --split validation --number 100
-python -m src.datasets.downloaders.download_coco
-python -m src.datasets.downloaders.download_flickr30k --number 100
-python -m src.datasets.downloaders.download_emoset --split train --number 100
-python -m src.datasets.downloaders.download_emoset --split test --number 100
-```
-
-Start small first. Verify metadata and file paths before downloading large datasets.
-
-COCO has a large official val2014 zip file. The downloader shows byte progress while downloading and file progress while extracting:
-
-```bash
-python -m src.datasets.downloaders.download_coco
-python -m src.datasets.downloaders.download_coco --skip-metadata
-```
-
-For the CxC SITS CLIP benchmark, prepare the merged Karpathy+CxC val metadata:
-
-```bash
-python -m src.datasets.downloaders.download_coco --skip-images --prepare-cxc
-```
-
-This writes files such as:
+Output:
 
 ```text
-data/metadata/coco_karpathy_cxc_sits_val.json
+evaluation_results/clap_eval_results.json
 ```
 
----
+This evaluates CLAP caption queries against candidate audio tracks from the CLAP benchmark. It reports the same metric family:
 
-## Create Image-Audio Benchmark
+- `ndcg@1`, `ndcg@5`, `ndcg@max-audios`
+- `mrr`
+- `mAP`
+- `recall@1`, `recall@5`, `recall@max-audios`
+- `precision@1`, `precision@5`, `precision@max-audios`
 
-The benchmark builder samples image metadata and audio metadata deterministically, asks an OpenAI model to score every assigned image/audio pair from 0 to 10, and writes resumable shard files.
+### Generate Benchmarks
 
-Set your client settings in `configs/reflectra.toml` or pass them on the CLI:
+Only regenerate benchmarks if you need new benchmark data.
 
-```toml
-[llm]
-base_url = ""
-api_key = ""
-api_key_env = "OPENAI_API_KEY"
-```
-
-For OpenAI-hosted models, setting the environment variable is usually enough:
+Reflectra image-to-audio benchmark:
 
 ```bash
-export OPENAI_API_KEY="..."
+bash scripts/generate_dataset.sh --max-samples 6
 ```
 
-For a local OpenAI-compatible server, set `base_url` in config or pass `--base_url`.
-
-Run a small single-shard benchmark:
+CLAP caption-to-audio benchmark:
 
 ```bash
-python -m src.benchmark.create_benchmark \
-  --mode build \
-  --image_samples 20 \
-  --audio_samples 20 \
-  --batch_size 10
+bash scripts/generate_clap_dataset.sh --audio-samples 100 --max-audios 6
 ```
 
-For multiple workers or machines, give every run the same metadata paths, sample counts, seed, model, and shard count, changing only `--shard_index`:
+Benchmark generation can resume existing shard files. It may require LLM settings in [configs/reflectra.toml](configs/reflectra.toml) or an `OPENAI_API_KEY`, depending on the backend you use for scoring.
+
+## Datasets Used
+
+Audio and music datasets:
+
+| Dataset | Link | Size | Reflectra usage |
+|---|---:|---:|---|
+| MusicCaps | [Hugging Face](https://huggingface.co/datasets/google/MusicCaps) | 5,521 music examples, each with an aspect list and free-text caption; 10-second clips from AudioSet. | Clean caption-to-music reference data. |
+| Song Describer Dataset | [Hugging Face](https://huggingface.co/datasets/renumics/song-describer-dataset), [paper](https://arxiv.org/abs/2311.10057) | 1.1k human-written descriptions for 706 music recordings. | Main captioned-song source for benchmark generation and study indexing. |
+| MTG-Jamendo | [Hugging Face](https://huggingface.co/datasets/rkstgr/mtg-jamendo) | Over 55,000 full audio tracks with 195 genre, instrument, and mood/theme tags; train/validation split is 90/10. | Large Creative Commons music source for study indexing. |
+| AudioSet | [Google Research](https://research.google.com/audioset/), [Hugging Face mirror](https://huggingface.co/datasets/agkphysics/AudioSet) | 2,084,320 human-labeled 10-second YouTube clips across hundreds of audio event classes. | Large weak-label audio source for study indexing. |
+
+Image datasets:
+
+| Dataset | Link | Size | Reflectra usage |
+|---|---:|---:|---|
+| Flickr30k | [Hugging Face](https://huggingface.co/datasets/nlphuji/flickr30k), [project page](https://shannon.cs.illinois.edu/DenotationGraph/) | 31,783 images and 158,915 crowd-sourced captions. | Projection training and image side of the Reflectra benchmark. |
+| EmoSet mirror | [Hugging Face](https://huggingface.co/datasets/LiangJian24/EmoSet) | 4,100 rows in this HF mirror: 2,100 train and 2,000 test. | Image mood metadata experiments. |
+| COCO 2014 / Karpathy metadata | [COCO](https://cocodataset.org/), [Karpathy metadata](http://cs.stanford.edu/people/karpathy/deepimagesent/coco.zip) | COCO image-caption data with Karpathy-style splits. | CLIP/CxC image-caption evaluation support. |
+
+Most local dataset files are generated into `data/metadata/` or unpacked benchmark directories by the scripts above. The main app does not require downloading every dataset if you already have a Qdrant snapshot.
+
+## Main Scripts
+
+`scripts/setup.sh`
+
+Creates `.venv` when missing, installs Reflectra in editable mode, starts Qdrant and Jaeger Docker containers, and prepares local directories.
 
 ```bash
-python -m src.benchmark.create_benchmark \
-  --mode build \
-  --image_samples 100 \
-  --audio_samples 100 \
-  --num_shards 4 \
-  --shard_index 0
+bash scripts/setup.sh start
 ```
 
-After all shards finish, merge them into compact Parquet tables:
+`scripts/train_proj.sh`
+
+Trains the image-to-CLAP projection on Flickr30k metadata. It downloads the needed metadata if the local file is too small.
 
 ```bash
-python -m src.benchmark.create_benchmark \
-  --mode merge \
-  --image_samples 100 \
-  --audio_samples 100 \
-  --num_shards 4
+bash scripts/train_proj.sh -n 1000
 ```
 
-By default, metadata is read from `data/metadata` and benchmark outputs are written to `data/benchmark`. The default benchmark model, random seed, output directory, and Hugging Face export setting live in `configs/reflectra.toml` under `[benchmark]`. CLI arguments override the config.
+`scripts/generate_dataset.sh`
 
-Merge writes the normalized byte tables:
+Builds or resumes the Reflectra image-to-audio benchmark. Use this only when you need to regenerate benchmark data.
+
+```bash
+bash scripts/generate_dataset.sh --max-samples 6
+```
+
+`scripts/generate_clap_dataset.sh`
+
+Builds or resumes the CLAP caption-to-audio benchmark.
+
+```bash
+bash scripts/generate_clap_dataset.sh --audio-samples 100 --max-audios 6
+```
+
+`scripts/evaluate_reflectra.sh`
+
+Downloads/unpacks the Reflectra benchmark and evaluates the full image-to-audio system.
+
+```bash
+bash scripts/evaluate_reflectra.sh --checkpoint checkpoints/reflectra_projection_flickr30k_1000.pt
+```
+
+`scripts/evaluate_clap.sh`
+
+Downloads/unpacks the CLAP benchmark and evaluates CLAP text-to-audio retrieval.
+
+```bash
+bash scripts/evaluate_clap.sh
+```
+
+`scripts/train_reranker.sh`
+
+Trains a reranker on the Reflectra benchmark score table.
+
+```bash
+bash scripts/train_reranker.sh -p checkpoints/reflectra_projection_flickr30k_1000.pt
+```
+
+## Outputs
+
+Common generated paths:
 
 ```text
-data/benchmark/audio_table.parquet
-data/benchmark/image_table.parquet
-data/benchmark/image_audio_scores.parquet
+qdrant_storage/                 Local Qdrant database
+data/vector_db/                 Vector DB snapshots
+data/study_audio_parts/         Study indexing state
+data/study_downloaded_audio/    GUI-downloaded playable clips
+evaluation_results/             Evaluation JSON outputs
+plots/                          Optional timing plots
 ```
 
----
+## Troubleshooting
 
-## Create CLAP LLM Benchmark
-
-To check whether CLAP is suitable for music captions before fine-tuning, create a caption-to-audio benchmark with LLM-graded positives and random negatives:
+If Qdrant is not reachable:
 
 ```bash
-python -m src.benchmark.create_clap_benchmark \
-  --audio_metadata data/metadata/custom_audio_metadata.jsonl \
-  --audio_samples 100 \
-  --queries_per_audio 1 \
-  --max_audios 10
+docker ps -a
+docker logs reflectra-qdrant
+bash scripts/setup.sh start
 ```
 
-Each query uses an audio caption and a deterministic candidate audio set. The
-LLM scores every candidate audio from 0 to 10. The builder supports sharded
-runs with `--num_shards` and `--shard_index`, so multiple workers can score
-different query partitions and resume incomplete shards.
-
-The final Hugging Face transport tables are:
-
-```text
-data/clap_benchmark/clap_llm_benchmark.parquet
-data/clap_benchmark/audio_table.parquet
-```
-
----
-
-## Evaluation
-
-There are three evaluation styles:
-
-1. CLAP evaluation against the LLM-scored caption-to-audio benchmark.
-2. CLIP evaluation against CxC graded image-caption relevance.
-3. Reflectra image-to-audio evaluation against the created benchmark.
-
-Evaluation computes model similarities and compares them with sparse relevance labels, so scripts do not create dense zero-filled relevance matrices.
-
----
-
-### 1. Evaluate CLAP: Text-to-Audio
-
-This evaluates CLAP against the LLM-scored CLAP benchmark created by `src.benchmark.create_clap_benchmark`.
-
-```bash
-python -m src.evaluation.evaluate_clap \
-  --benchmark_dir data/clap_benchmark
-```
-
-The script computes CLAP text-to-audio rankings for each benchmark caption over that query's positive and random-negative candidate audios.
-
-Metrics:
-
-```text
-- ndcg@1, ndcg@5, ndcg@max-audios
-- mrr
-- mAP
-- recall@1, recall@5, recall@max-audios
-- precision@1, precision@5, precision@max-audios
-```
-
-NDCG uses the LLM 0..10 score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant. Metrics are computed only over audios scored for each query, so unevaluated audios are not treated as irrelevant.
-
----
-
-### 2. Evaluate CLIP: Image-to-Caption CxC
-
-This evaluates CLIP with CxC SITS graded image-caption relevance labels. It is the old CxC evaluator, now exposed as `evaluate_clip.py`.
-
-```bash
-python -m src.evaluation.evaluate_clip \
-  --metadata data/metadata/coco_karpathy_cxc_sits_val.json \
-  --image-root data/coco_images \
-  --max-images 1000
-```
-
-The script computes:
-
-```text
-image → caption
-caption → image
-```
-
-Metrics:
-
-```text
-- ndcg@1, ndcg@5, ndcg@10
-- mrr
-- mAP
-- recall@1, recall@5, recall@10
-- precision@1, precision@5, precision@10
-```
-
-For MRR, mAP, recall, and precision, every CxC score `> 0` is treated as relevant. NDCG uses the raw graded CxC score.
-
----
-
-### 3. Evaluate Reflectra: Image-to-Audio
-
-This evaluates the full image-to-audio system on the benchmark created by `src.benchmark.create_benchmark`.
-
-```bash
-python -m src.datasets.downloaders.download_reflectra_benchmark
-
-python -m src.evaluation.evaluate_reflectra \
-  --benchmark data/benchmark \
-  --checkpoint checkpoints/reflectra.pt
-```
-
-The downloader unpacks media from the Hugging Face Parquet tables, writes JSONL indexes, and removes the local Parquet transport files. The evaluator reads those unpacked files directly.
-
-Metrics:
-
-```text
-- ndcg@1, ndcg@5, ndcg@max-audios
-- mrr
-- mAP
-- recall@1, recall@5, recall@max-audios
-- precision@1, precision@5, precision@max-audios
-```
-
-NDCG uses the benchmark LLM score as graded relevance. MRR, mAP, recall, and precision treat scores above `--relevance-threshold` as relevant. Metrics are computed only over audios scored for each image, so unevaluated audios are not treated as irrelevant.
-
----
-
-### 4. Index Your Music in Qdrant
-
-Put local music files under `data/music/`, or pass any folder with `--music-dir`.
-
-```bash
-python -m src.vector_db.index_clap_audio_qdrant \
-  --music-dir data/music
-```
-
-Index another folder:
-
-```bash
-python -m src.vector_db.index_clap_audio_qdrant \
-  --music-dir /path/to/my/music \
-  --collection-name reflectra_music_clap
-```
-
-Each indexed audio point should contain payload fields like:
-
-```json
-{
-  "audio_id": "...",
-  "audio_path": "...",
-  "relative_path": "...",
-  "filename": "...",
-  "stem": "...",
-  "extension": "...",
-  "source": "local_music_library"
-}
-```
-
-Defaults such as CLAP model name, Qdrant URL, collection name, vector size, batch size, and audio extensions come from `configs/reflectra.toml`. CLI arguments override the config.
-
-## Benchmarks Used
-
-Reflectra uses three benchmark sources:
-
-- Reflectra image-to-audio benchmark: https://huggingface.co/datasets/AraNge/reflectra-benchmark
-- Reflectra CLAP caption-to-audio benchmark: https://huggingface.co/datasets/AraNge/reflectra-clap-benchmark
-- CLIP CxC image-caption benchmark labels: https://github.com/google-research-datasets/Crisscrossed-Captions
-
-The CLIP CxC evaluation uses CxC SITS graded semantic similarity labels on
-MS-COCO image/caption pairs. The Reflectra and CLAP benchmark repositories are
-distributed as Parquet transport tables and should be unpacked locally with the
-downloaders before evaluation.
-
-## Dataset Links
-
-Audio-text datasets:
-
-- MusicCaps: https://huggingface.co/datasets/google/MusicCaps
-- Song Describer Dataset: https://huggingface.co/datasets/renumics/song-describer-dataset
-- MTG-Jamendo Hugging Face: https://huggingface.co/datasets/rkstgr/mtg-jamendo
-- AudioSet Hugging Face: https://huggingface.co/datasets/agkphysics/AudioSet
-
-Image-text / image-mood datasets:
-
-- Flickr30k Hugging Face: https://huggingface.co/datasets/nlphuji/flickr30k
-- EmoSet: https://huggingface.co/datasets/LiangJian24/EmoSet
-- CxC SITS labels: https://github.com/google-research-datasets/Crisscrossed-Captions
-- COCO 2014 validation images: http://images.cocodataset.org/zips/val2014.zip
-- Karpathy COCO caption metadata: http://cs.stanford.edu/people/karpathy/deepimagesent/coco.zip
+If the GUI finds tracks but `Play` fails, first try `Save`. Dataset downloads may require network access and Hugging Face cache availability. Saved audio files can still be opened directly from `data/study_downloaded_audio/`.

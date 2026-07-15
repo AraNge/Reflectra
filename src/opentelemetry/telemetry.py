@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -71,6 +72,19 @@ class StageTimer:
         self._tracer = trace.get_tracer(__name__) if trace is not None else None
 
     @contextmanager
+    def trace(self) -> Iterator[None]:
+        if self._tracer is None:
+            yield
+            return
+
+        with self._tracer.start_as_current_span(self.trace_name) as span:
+            span.set_attribute("reflectra.trace_name", self.trace_name)
+            try:
+                yield
+            finally:
+                span.set_attribute("reflectra.stage.count", len(self.timings))
+
+    @contextmanager
     def stage(self, name: str) -> Iterator[None]:
         start = time.perf_counter()
         span_context = (
@@ -121,6 +135,12 @@ class StageTimer:
         return path
 
     def save_plot(self, output_path: str | Path, show: bool = False) -> Path:
+        if not show:
+            os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp") / "reflectra_matplotlib"))
+            import matplotlib
+
+            matplotlib.use("Agg")
+
         import matplotlib.pyplot as plt
 
         path = Path(output_path)
@@ -128,30 +148,96 @@ class StageTimer:
 
         stages = [timing.stage for timing in self.timings]
         seconds = [timing.seconds for timing in self.timings]
+        total_seconds = sum(seconds)
+        max_total = total_seconds or 1.0
+        colors = [
+            "#1f77b4",
+            "#ff7f0e",
+            "#138a22",
+            "#d62728",
+            "#9467bd",
+            "#8c564b",
+            "#17becf",
+        ]
 
-        plt.figure(figsize=(9, 4.5))
-        bars = plt.bar(stages, seconds, color="#4C78A8")
-        plt.ylabel("Seconds")
-        plt.title(f"Stage Time: {self.trace_name}")
-        plt.xticks(rotation=30, ha="right")
-        plt.grid(axis="y", alpha=0.25)
-
-        for bar, value in zip(bars, seconds):
-            plt.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height(),
-                f"{value:.3f}s",
-                ha="center",
-                va="bottom",
-                fontsize=8,
+        fig, ax = plt.subplots(figsize=(12, 8))
+        bottom = 0.0
+        for index, (stage, value) in enumerate(zip(stages, seconds)):
+            color = colors[index % len(colors)]
+            ax.bar(
+                [0],
+                [value],
+                bottom=[bottom],
+                width=0.62,
+                color=color,
+                edgecolor="white",
+                linewidth=0.8,
+                label=f"{stage} (≈ {value:.3f}s)",
             )
 
-        plt.tight_layout()
-        plt.savefig(path, dpi=200)
+            if value >= max_total * 0.045:
+                ax.text(
+                    0,
+                    bottom + value / 2,
+                    f"{value:.3f}s",
+                    ha="center",
+                    va="center",
+                    color="white",
+                    fontsize=15,
+                    fontweight="bold",
+                )
+            else:
+                ax.annotate(
+                    f"{value:.3f}s",
+                    xy=(0.31, bottom + value),
+                    xytext=(0.42, bottom + max_total * 0.04),
+                    arrowprops={"arrowstyle": "-", "color": color},
+                    color=color,
+                    fontsize=13,
+                    fontweight="bold",
+                )
+            bottom += value
+
+        ax.text(
+            0,
+            total_seconds + max_total * 0.025,
+            f"Total: {total_seconds:.3f}s",
+            ha="center",
+            va="bottom",
+            fontsize=16,
+            fontweight="bold",
+        )
+        ax.set_title(f"Stage Time: {self.trace_name}", fontsize=24, pad=18)
+        ax.set_ylabel("Seconds", fontsize=15)
+        ax.set_xticks([0], ["Total"])
+        ax.set_xlim(-0.55, 0.85)
+        ax.set_ylim(0, max_total * 1.2)
+        ax.grid(axis="y", linestyle=(0, (4, 4)), color="#cfcfcf", linewidth=1)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=13)
+
+        fig.tight_layout()
+        fig.savefig(path, dpi=200, bbox_inches="tight")
 
         if show:
             plt.show()
         else:
-            plt.close()
+            plt.close(fig)
 
         return path
+
+
+def force_flush_traces(timeout_millis: int = 5000) -> None:
+    if trace is None:
+        return
+
+    provider = trace.get_tracer_provider()
+    force_flush = getattr(provider, "force_flush", None)
+    if force_flush is None:
+        return
+    try:
+        force_flush(timeout_millis=timeout_millis)
+    except TypeError:
+        force_flush()

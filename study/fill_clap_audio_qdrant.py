@@ -110,12 +110,26 @@ def get_collection_count(client: QdrantClient, collection_name: str) -> int:
 
 
 def build_payload(record: AudioRecord) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "audio_id": record.audio_id,
         "dataset_id": record.dataset_id,
         "source_dataset": record.source_dataset,
         "captions": record.captions,
     }
+    optional_values = {
+        "dataset_key": record.dataset_key,
+        "dataset_split": record.dataset_split,
+        "dataset_subset": record.dataset_subset,
+        "archive_idx": record.archive_idx,
+    }
+    payload.update(
+        {
+            key: value
+            for key, value in optional_values.items()
+            if value is not None
+        }
+    )
+    return payload
 
 
 def index_records(
